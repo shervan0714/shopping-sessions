@@ -164,12 +164,26 @@ impl<T: Copy + 'static> Parts<T> {
     }
 }
 
-/// A bump allocator of fixed-size row blocks carved from huge-page regions;
-/// never freed (the process exits right after writing its outputs).
+/// Every row block is one `POOL_BLOCK`-byte slot. Slots freed by one stage
+/// (event blocks after dedup) are reused by the next (survivor blocks), so
+/// that stage writes into memory that is already mapped instead of faulting
+/// in and zeroing fresh pages.
+pub const POOL_BLOCK: usize = 81920;
+static POOL: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Return a slot (the start of a block) to the pool.
+pub fn pool_put(p: *const u8) {
+    POOL.lock().unwrap().push(p as usize);
+}
+
+/// A bump allocator of fixed-size row blocks carved from huge-page regions
+/// (or reused pool slots); never unmapped (the process exits right after
+/// writing its outputs).
 pub struct Blocks<T> {
-    cur: *mut T,
+    cur: *mut u8,
     left: usize,
     block: usize,
+    _t: std::marker::PhantomData<T>,
 }
 
 unsafe impl<T> Send for Blocks<T> {}
@@ -177,22 +191,27 @@ unsafe impl<T> Send for Blocks<T> {}
 const REGION: usize = 64 << 20;
 
 impl<T> Blocks<T> {
+    /// Blocks of `block` rows; must fit one pool slot.
     pub fn new(block: usize) -> Self {
-        Blocks { cur: std::ptr::null_mut(), left: 0, block }
+        assert!(block * std::mem::size_of::<T>() <= POOL_BLOCK);
+        Blocks { cur: std::ptr::null_mut(), left: 0, block, _t: std::marker::PhantomData }
     }
     #[inline]
     pub fn take(&mut self) -> *mut T {
+        if let Some(p) = POOL.lock().unwrap().pop() {
+            return p as *mut T;
+        }
         if self.left == 0 {
-            let per = (REGION / (self.block * std::mem::size_of::<T>())).max(1);
-            let p = map_huge(per * self.block * std::mem::size_of::<T>());
+            let per = REGION / POOL_BLOCK;
+            let p = map_huge(per * POOL_BLOCK);
             assert!(!p.is_null(), "out of memory");
-            self.cur = p as *mut T;
+            self.cur = p;
             self.left = per;
         }
         let b = self.cur;
         // SAFETY: stays inside the current region.
-        self.cur = unsafe { self.cur.add(self.block) };
+        self.cur = unsafe { self.cur.add(POOL_BLOCK) };
         self.left -= 1;
-        b
+        b as *mut T
     }
 }

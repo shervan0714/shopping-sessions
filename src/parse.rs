@@ -4,7 +4,9 @@
 use crate::scan::scan;
 use crate::input::Lookups;
 use crate::idkey::{key, mix};
-use crate::alloc::Blocks;
+use crate::alloc::{Blocks, Parts, POOL_BLOCK};
+use crate::people::{ppart, People, PP};
+use std::sync::OnceLock;
 use crate::intern::Interner;
 use crate::ts::{self, DAY};
 
@@ -68,6 +70,9 @@ pub struct ClickRow {
 pub struct Ctx<'a> {
     pub lookups: &'a Lookups,
     pub exotic: &'a Interner,
+    /// Set by the people thread; clicks (parsed after links and events)
+    /// are resolved to their person right away.
+    pub people: &'a OnceLock<People>,
     pub ws: i64,
     pub we: i64,
 }
@@ -81,7 +86,9 @@ pub struct Worker {
     full: Vec<Vec<&'static [EvRow]>>,
     arena: Blocks<EvRow>,
     pub n_events: usize,
-    pub clicks: Vec<ClickRow>,
+    /// Valid clicks, already in person partitions.
+    pub clicks: Parts<ClickRow>,
+    pub n_clicks: usize,
 }
 
 #[derive(Default)]
@@ -101,7 +108,8 @@ impl Worker {
             full: (0..EV_PARTS).map(|_| Vec::new()).collect(),
             arena,
             n_events: 0,
-            clicks: Vec::new(),
+            clicks: Parts::new(PP, POOL_BLOCK / std::mem::size_of::<ClickRow>()),
+            n_clicks: 0,
         }
     }
 
@@ -125,7 +133,7 @@ impl Worker {
     }
 
     /// Every block of each bucket (full ones and the open one).
-    pub fn into_parts(self) -> (Vec<Vec<&'static [EvRow]>>, Vec<ClickRow>) {
+    pub fn into_parts(self) -> (Vec<Vec<&'static [EvRow]>>, Vec<Vec<&'static [ClickRow]>>) {
         let mut full = self.full;
         for p in 0..EV_PARTS {
             if self.open_len[p] > 0 {
@@ -133,7 +141,7 @@ impl Worker {
                 full[p].push(unsafe { std::slice::from_raw_parts(self.open[p], self.open_len[p] as usize) });
             }
         }
-        (full, self.clicks)
+        (full, self.clicks.finish())
     }
 }
 
@@ -203,6 +211,30 @@ pub fn events_chunk(chunk: &'static [u8], ctx: &Ctx, w: &mut Worker) {
 
 pub fn clicks_chunk(chunk: &'static [u8], ctx: &Ctx, w: &mut Worker) {
     let lo = ctx.ws - 7 * DAY;
+    let people = loop {
+        if let Some(p) = ctx.people.get() {
+            break p;
+        }
+        std::thread::yield_now();
+    };
+    // Person lookups are random reads: resolve clicks in batches, with the
+    // filter words and then the table slots prefetched for the whole batch.
+    const BATCH: usize = 64;
+    let mut buf = [ClickRow { ts: 0, cid: 0, user: 0, campaign: 0 }; BATCH];
+    let mut nb = 0usize;
+    let flush = |buf: &[ClickRow], w: &mut Worker| {
+        for c in buf {
+            people.prefetch_filter(c.user);
+        }
+        for c in buf {
+            people.prefetch_slot(c.user);
+        }
+        for c in buf {
+            let person = people.person(c.user);
+            w.clicks.push(ppart(person), ClickRow { user: person, ..*c });
+        }
+        w.n_clicks += buf.len();
+    };
     scan::<4>(chunk, |f| {
         let &[cid, user, campaign, tsf] = f;
         if cid.is_empty() || user.is_empty() {
@@ -213,13 +245,14 @@ pub fn clicks_chunk(chunk: &'static [u8], ctx: &Ctx, w: &mut Worker) {
             return;
         }
         let Some(c) = ctx.lookups.campaigns.get(campaign) else { return };
-        w.clicks.push(ClickRow {
-            ts: t,
-            cid: key(cid, ctx.exotic),
-            user: key(user, ctx.exotic),
-            campaign: c,
-        });
+        buf[nb] = ClickRow { ts: t, cid: key(cid, ctx.exotic), user: key(user, ctx.exotic), campaign: c };
+        nb += 1;
+        if nb == BATCH {
+            flush(&buf, w);
+            nb = 0;
+        }
     });
+    flush(&buf[..nb], w);
 }
 
 pub fn links_chunk(chunk: &'static [u8], ctx: &Ctx, links: &mut Vec<(u64, u64)>) {

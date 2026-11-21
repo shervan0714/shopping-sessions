@@ -54,13 +54,7 @@ struct Surv {
     cat: u32,
 }
 
-/// Person partitions for the session stage.
-const PP_BITS: u32 = 8;
-const PP: usize = 1 << PP_BITS;
-#[inline(always)]
-fn ppart(k: u64) -> usize {
-    (idkey::mix(k) >> (64 - PP_BITS)) as usize
-}
+use people::{ppart, PP};
 
 /// A raw pointer that may be shared between threads; every user writes or
 /// borrows disjoint ranges only.
@@ -160,12 +154,9 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
 
     // ---- 2. parse ---------------------------------------------------------
     let exotic = intern::Interner::new();
-    let pctx = parse::Ctx { lookups: &lookups, exotic: &exotic, ws, we };
+    let people_cell: std::sync::OnceLock<people::People> = std::sync::OnceLock::new();
+    let pctx = parse::Ctx { lookups: &lookups, exotic: &exotic, people: &people_cell, ws, we };
     let nthreads = rayon::current_num_threads();
-    // Reserve generously so the per-worker vectors never reallocate and copy
-    // (an event line is at least ~60 bytes; unused capacity is never touched,
-    // so it costs address space only).
-    let cl_bytes: usize = mapped.iter().filter(|m| m.0 == 1).map(|m| m.1.len()).sum();
     // Links first (small), so the people table can be built on its own
     // thread while the events and clicks are parsed.
     let n_link_tasks = tasks.iter().take_while(|t| t.0 == 2).count();
@@ -179,37 +170,41 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
         .collect();
     next.store(n_link_tasks, Relaxed);
     let n_links: usize = link_vecs.iter().map(Vec::len).sum();
-    let (people, workers) = std::thread::scope(|sc| {
-        let h = sc.spawn(|| people::People::build(&link_vecs, &exotic));
-        let workers: Vec<Worker> = parse_all(nthreads, tasks, next, &pctx, cl_bytes, release_chunks);
-        (h.join().expect("people thread"), workers)
+    let workers = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            let _ = people_cell.set(people::People::build(&link_vecs, &exotic));
+        });
+        parse_all(nthreads, tasks, next, &pctx, release_chunks)
     });
+    let people = people_cell.get().expect("people table");
     drop(link_vecs);
     let n_ev_rows: usize = workers.iter().map(|w| w.n_events).sum();
-    let n_clicks: usize = workers.iter().map(|w| w.clicks.len()).sum();
+    let n_clicks: usize = workers.iter().map(|w| w.n_clicks).sum();
     log(t0, &format!("parsed: {n_ev_rows} event rows, {n_clicks} valid clicks, {n_links} links"));
     log(t0, &format!("people: {} linked ids, {} merged into another person", people.n_ids, people.n_merged));
 
     // ---- 3. regroup worker output ---------------------------------------------
     let mut buckets: Vec<Vec<&'static [EvRow]>> = (0..EV_PARTS).map(|_| Vec::new()).collect();
-    let mut click_vecs: Vec<Vec<ClickRow>> = Vec::with_capacity(nthreads);
+    let mut cl_parts: Vec<Vec<&'static [ClickRow]>> = (0..PP).map(|_| Vec::new()).collect();
     for w in workers {
         let (blocks, clicks) = w.into_parts();
         for (p, b) in blocks.into_iter().enumerate() {
             buckets[p].extend(b);
         }
-        click_vecs.push(clicks);
+        for (p, b) in clicks.into_iter().enumerate() {
+            cl_parts[p].extend(b);
+        }
     }
 
     // ---- 4. dedup events -----------------------------------------------------
     // Survivors go straight into per-thread block chains, one per person
     // partition (no intermediate array, no second scatter pass).
-    let writers: Vec<Mutex<alloc::Parts<Surv>>> = (0..nthreads).map(|_| Mutex::new(alloc::Parts::new(PP, 1024))).collect();
+    let writers: Vec<Mutex<alloc::Parts<Surv>>> = (0..nthreads).map(|_| Mutex::new(alloc::Parts::new(PP, alloc::POOL_BLOCK / std::mem::size_of::<Surv>()))).collect();
     let n_surv: usize = buckets
         .into_par_iter()
         .map(|blocks| {
             let t = rayon::current_thread_index().unwrap_or(0);
-            dedup(blocks, &people, &mut writers[t].lock().unwrap())
+            dedup(blocks, people, &mut writers[t].lock().unwrap())
         })
         .sum();
     let mut ev_parts: Vec<Vec<&'static [Surv]>> = (0..PP).map(|_| Vec::new()).collect();
@@ -221,16 +216,6 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     log(t0, &format!("dedup: {n_surv} surviving events"));
 
     // ---- 5. partition by person -----------------------------------------------
-    click_vecs.par_iter_mut().for_each(|v| {
-        for c in v.iter_mut() {
-            c.user = people.person(c.user);
-        }
-    });
-    let srcs: Vec<&[ClickRow]> = click_vecs.iter().flat_map(|v| v.chunks(1 << 16)).collect();
-    let (mut clicks, cl_off) = people::partition::<ClickRow, PP>(&srcs, |c| ppart(c.user));
-    drop(srcs);
-    drop(click_vecs);
-    log(t0, "partitioned by person");
 
     // ---- 6. sessions, attribution, aggregation ------------------------------
     let day0 = ws.div_euclid(DAY);
@@ -242,9 +227,16 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
         organic: ncamp as u32,
         rank: &lookups.category_rank,
     };
+    let uw = UserWriter {
+        dir: out_dir.join("user_daily"),
+        cats: lookups.categories.iter().map(|c| bytes::Bytes::copy_from_slice(c)).collect(),
+        files: AtomicUsize::new(0),
+    };
+    std::fs::create_dir_all(&uw.dir)?;
+    let write_err: Mutex<Option<Error>> = Mutex::new(None);
     let accs: Vec<Mutex<Acc>> = (0..nthreads).map(|_| Mutex::new(Acc::new((ncamp + 1) * ndays))).collect();
     {
-        let clp = SendPtr(clicks.as_mut_ptr());
+        let cl_parts = &cl_parts;
         // Largest partitions first, so no big one starts last.
         let mut order: Vec<usize> = (0..PP).collect();
         let ev_len: Vec<usize> = ev_parts.iter().map(|v| v.iter().map(|b| b.len()).sum()).collect();
@@ -252,10 +244,8 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
         let ev_parts = &ev_parts;
         let exotic = &exotic;
         order.into_par_iter().with_max_len(1).for_each(|p| {
-            // SAFETY: partition ranges are disjoint; each is visited once.
-            let cls = unsafe { std::slice::from_raw_parts(clp.get().add(cl_off[p]) as *const ClickRow, cl_off[p + 1] - cl_off[p]) };
             let mut g = GROUP.with(|c| std::mem::take(&mut *c.borrow_mut()));
-            group_partition(&ev_parts[p], cls, &mut g);
+            group_partition(&ev_parts[p], &cl_parts[p], &mut g);
             let t = rayon::current_thread_index().unwrap_or(0);
             let mut acc = accs[t].lock().unwrap();
             let Group { persons, ev_off, evs, cl_off, cls: gcls, .. } = &mut g;
@@ -270,16 +260,24 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
                 }
                 process_person(person, e, c, &mut acc, &sctx);
             }
+            let flush = (acc.users.len() >= USER_FLUSH).then(|| std::mem::take(&mut acc.users));
             drop(acc);
+            if let Some(rows) = flush {
+                if let Err(e) = uw.write(&rows, exotic) {
+                    *write_err.lock().unwrap() = Some(e);
+                }
+            }
             GROUP.with(|c| *c.borrow_mut() = g);
         });
     }
-    drop(clicks);
+    if let Some(e) = write_err.into_inner().unwrap() {
+        return Err(e);
+    }
     log(t0, "sessions done");
 
     // ---- 7. output -------------------------------------------------------------
     let accs: Vec<Acc> = accs.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    write_outputs(out_dir, &accs, &exotic, &lookups, &sctx, ncamp)?;
+    write_outputs(out_dir, &accs, &exotic, &lookups, &sctx, ncamp, &uw)?;
     log(t0, "outputs written");
     Ok(())
 }
@@ -290,14 +288,12 @@ fn parse_all(
     tasks: &'static [(u8, &'static [u8])],
     next: &'static AtomicUsize,
     pctx: &parse::Ctx,
-    cl_bytes: usize,
     release_chunks: bool,
 ) -> Vec<Worker> {
     (0..nthreads)
         .into_par_iter()
         .map(|_| {
             let mut w = Worker::new();
-            w.clicks.reserve(cl_bytes / 30 * 2 / nthreads + 1024);
             loop {
                 let i = next.fetch_add(1, Relaxed);
                 let Some(&(k, chunk)) = tasks.get(i) else { break };
@@ -332,7 +328,7 @@ struct Group {
 /// Group a partition's events by person with a hash table (persons in first
 /// seen order) and attach each person's clicks; clicks of persons with no
 /// event are dropped (they cannot credit or assist anything).
-fn group_partition(blocks: &[&'static [Surv]], cls: &[ClickRow], g: &mut Group) {
+fn group_partition(blocks: &[&'static [Surv]], cls: &[&'static [ClickRow]], g: &mut Group) {
     const EMPTY: u64 = u64::MAX;
     let n: usize = blocks.iter().map(|b| b.len()).sum();
     let cap = (2 * n).next_power_of_two().max(16);
@@ -407,7 +403,7 @@ fn group_partition(blocks: &[&'static [Surv]], cls: &[ClickRow], g: &mut Group) 
     g.cpidx.clear();
     g.cl_off.clear();
     g.cl_off.resize(np + 1, 0);
-    for c in cls {
+    for c in cls.iter().flat_map(|b| b.iter()) {
         match find(&g.table, c.user) {
             Some(pi) => {
                 g.cl_off[pi as usize] += 1;
@@ -427,7 +423,7 @@ fn group_partition(blocks: &[&'static [Surv]], cls: &[ClickRow], g: &mut Group) 
     {
         let mut pos: Vec<u32> = g.cl_off[..np].to_vec();
         let out = g.cls.as_mut_ptr();
-        for (c, &pi) in cls.iter().zip(&g.cpidx) {
+        for (c, &pi) in cls.iter().flat_map(|b| b.iter()).zip(&g.cpidx) {
             if pi != u32::MAX {
                 // SAFETY: every slot in 0..acc is written exactly once.
                 unsafe { out.add(pos[pi as usize] as usize).write(*c) };
@@ -560,6 +556,11 @@ fn dedup(blocks: Vec<&'static [EvRow]>, people: &people::People, out: &mut alloc
             out.push(ppart(person), Surv { person, ts: r.ts, price_kind: r.price_kind, cat: r.cat });
         }
         kept += n;
+        // This bucket's event blocks are dead now: recycle them for the
+        // survivor blocks other buckets are about to fill.
+        for b in &blocks {
+            alloc::pool_put(b.as_ptr() as *const u8);
+        }
         kept
     })
 }
@@ -760,6 +761,56 @@ fn process_person(p: u64, evs: &[Surv], cls: &[ClickRow], acc: &mut Acc, cx: &Se
     }
 }
 
+/// Writes user_daily files (one per call), numbered in call order.
+struct UserWriter {
+    dir: PathBuf,
+    cats: Vec<bytes::Bytes>,
+    files: AtomicUsize,
+}
+
+impl UserWriter {
+    fn write(&self, rows: &[UserRow], exotic: &intern::Interner) -> Result<(), Error> {
+        let i = self.files.fetch_add(1, Relaxed);
+        // Names go into one buffer, handed to Parquet as zero-copy slices.
+        let mut buf = Vec::with_capacity(rows.len() * 10);
+        let mut ends = Vec::with_capacity(rows.len());
+        for r in rows.iter() {
+            idkey::write(r.person, exotic, &mut buf);
+            ends.push(buf.len());
+        }
+        let buf = bytes::Bytes::from(buf);
+        let mut c = output::UserCols {
+            user_id: Vec::with_capacity(rows.len()),
+            day: Vec::with_capacity(rows.len()),
+            sessions: Vec::with_capacity(rows.len()),
+            events: Vec::with_capacity(rows.len()),
+            revenue: Vec::with_capacity(rows.len()),
+            top: Vec::with_capacity(rows.len()),
+            top_def: Vec::with_capacity(rows.len()),
+        };
+        let mut start = 0;
+        for (r, &end) in rows.iter().zip(&ends) {
+            c.user_id.push(ByteArray::from(buf.slice(start..end)));
+            start = end;
+            c.day.push(r.day);
+            c.sessions.push(r.sessions as i64);
+            c.events.push(r.events as i64);
+            c.revenue.push(r.revenue);
+            if r.top == NO_CATEGORY {
+                c.top_def.push(0);
+            } else {
+                c.top_def.push(1);
+                c.top.push(ByteArray::from(self.cats[r.top as usize].clone()));
+            }
+        }
+        output::write_user(&self.dir.join(format!("part-{i:05}.parquet")), &c)
+    }
+}
+
+/// A thread's user rows are written out as soon as this many pile up, so
+/// most of user_daily is written while other threads are still sessionizing.
+const USER_FLUSH: usize = 1 << 18;
+
 fn write_outputs(
     out_dir: &Path,
     accs: &[Acc],
@@ -767,10 +818,9 @@ fn write_outputs(
     lookups: &Lookups,
     cx: &SessCtx,
     ncamp: usize,
+    uw: &UserWriter,
 ) -> Result<(), Error> {
-    let ud = out_dir.join("user_daily");
     let cd = out_dir.join("campaign_daily");
-    std::fs::create_dir_all(&ud)?;
     std::fs::create_dir_all(&cd)?;
 
     // campaign_daily: sum the per-thread arrays (tiny), then one file.
@@ -817,48 +867,10 @@ fn write_outputs(
     let total: usize = accs.iter().map(|a| a.users.len()).sum();
     let piece = total.div_ceil(4 * rayon::current_num_threads()).max(1 << 14);
     let pieces: Vec<&[UserRow]> = accs.iter().flat_map(|a| a.users.chunks(piece)).collect();
-    let cats: Vec<bytes::Bytes> = lookups.categories.iter().map(|c| bytes::Bytes::copy_from_slice(c)).collect();
     let user_job = || -> Result<(), Error> {
         let empty: [&[UserRow]; 1] = [&[]];
-        let pieces: &[&[UserRow]] = if pieces.is_empty() { &empty } else { &pieces };
-        pieces
-            .par_iter()
-            .enumerate()
-            .map(|(i, rows)| {
-                let mut buf = Vec::with_capacity(rows.len() * 10);
-                let mut ends = Vec::with_capacity(rows.len());
-                for r in rows.iter() {
-                    idkey::write(r.person, exotic, &mut buf);
-                    ends.push(buf.len());
-                }
-                let buf = bytes::Bytes::from(buf);
-                let mut c = output::UserCols {
-                    user_id: Vec::with_capacity(rows.len()),
-                    day: Vec::with_capacity(rows.len()),
-                    sessions: Vec::with_capacity(rows.len()),
-                    events: Vec::with_capacity(rows.len()),
-                    revenue: Vec::with_capacity(rows.len()),
-                    top: Vec::with_capacity(rows.len()),
-                    top_def: Vec::with_capacity(rows.len()),
-                };
-                let mut start = 0;
-                for (r, &end) in rows.iter().zip(&ends) {
-                    c.user_id.push(ByteArray::from(buf.slice(start..end)));
-                    start = end;
-                    c.day.push(r.day);
-                    c.sessions.push(r.sessions as i64);
-                    c.events.push(r.events as i64);
-                    c.revenue.push(r.revenue);
-                    if r.top == NO_CATEGORY {
-                        c.top_def.push(0);
-                    } else {
-                        c.top_def.push(1);
-                        c.top.push(ByteArray::from(cats[r.top as usize].clone()));
-                    }
-                }
-                output::write_user(&ud.join(format!("part-{i:05}.parquet")), &c)
-            })
-            .collect::<Result<Vec<()>, Error>>()?;
+        let pieces: &[&[UserRow]] = if pieces.is_empty() && uw.files.load(Relaxed) == 0 { &empty } else { &pieces };
+        pieces.par_iter().map(|rows| uw.write(rows, exotic)).collect::<Result<Vec<()>, Error>>()?;
         Ok(())
     };
     let (a, b) = rayon::join(campaign_job, user_job);

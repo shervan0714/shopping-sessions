@@ -84,19 +84,27 @@ pub fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N]
         }
         let mut out: [&'a [u8]; N] = [&[]; N];
         let mut s = line_start;
-        for k in 0..N {
-            let e = if k + 1 < N { commas[k] } else { line_end };
-            out[k] = &data[s..e];
-            s = e + 1;
-        }
-        if quotes != 0 {
+        if quotes == 0 {
+            for k in 0..N {
+                let e = if k + 1 < N { commas[k] } else { line_end };
+                out[k] = &data[s..e];
+                s = e + 1;
+            }
+        } else {
+            // Which fields are quoted is data-dependent and random, so the
+            // unwrap is computed without branches.
             let mut wrapped = 0u32;
-            for fld in out.iter_mut() {
-                let l = fld.len();
-                if l >= 2 && fld[0] == b'"' && fld[l - 1] == b'"' {
-                    wrapped += 1;
-                    *fld = &fld[1..l - 1];
-                }
+            for k in 0..N {
+                let e = if k + 1 < N { commas[k] } else { line_end };
+                let l = e - s;
+                // Indices clamped into the line so the reads are always in
+                // bounds; the result only counts when l >= 2.
+                let first = data[s.min(e.saturating_sub(1)).max(line_start).min(n - 1)];
+                let last = data[e.saturating_sub(1).max(line_start).min(n - 1)];
+                let w = ((l >= 2) & (first == b'"') & (last == b'"')) as usize;
+                wrapped += w as u32;
+                out[k] = &data[s + w..e - w];
+                s = e + 1;
             }
             if quotes != 2 * wrapped {
                 return;

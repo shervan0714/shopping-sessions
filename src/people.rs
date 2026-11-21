@@ -10,9 +10,16 @@
 use crate::idkey::{self, mix};
 use crate::intern::Interner;
 use hashbrown::HashMap;
-use rayon::prelude::*;
 
-const EMPTY: u64 = u64::MAX; // never a key: packed keys use 60 bits, exotic ones 63+32
+const EMPTY: u64 = u64::MAX;
+
+/// Person partitions for the session stage (by hash of the person key).
+pub const PP_BITS: u32 = 8;
+pub const PP: usize = 1 << PP_BITS;
+#[inline(always)]
+pub fn ppart(k: u64) -> usize {
+    (mix(k) >> (64 - PP_BITS)) as usize
+} // never a key: packed keys use 60 bits, exotic ones 63+32
 
 pub struct People {
     mask: usize,
@@ -168,47 +175,4 @@ impl People {
             s = (s + 1) & self.mask;
         }
     }
-}
-
-/// Scatter rows from many sources into `NP` partitions: returns all rows
-/// grouped by partition and the partition offsets (`NP + 1`). Parallel over
-/// the sources; each source writes disjoint, precomputed ranges.
-pub fn partition<T: Copy + Send + Sync, const NP: usize>(
-    srcs: &[&[T]],
-    part: impl Fn(&T) -> usize + Sync,
-) -> (Vec<T>, Vec<usize>) {
-    let counts: Vec<Vec<u32>> = srcs
-        .par_iter()
-        .map(|s| {
-            let mut c = vec![0u32; NP];
-            for x in s.iter() {
-                c[part(x)] += 1;
-            }
-            c
-        })
-        .collect();
-    let mut starts: Vec<Vec<usize>> = vec![vec![0; NP]; srcs.len()];
-    let mut off = Vec::with_capacity(NP + 1);
-    let mut acc = 0usize;
-    for p in 0..NP {
-        off.push(acc);
-        for (si, c) in counts.iter().enumerate() {
-            starts[si][p] = acc;
-            acc += c[p] as usize;
-        }
-    }
-    off.push(acc);
-    let mut out: Vec<T> = Vec::with_capacity(acc);
-    let ptr = crate::SendPtr(out.as_mut_ptr());
-    srcs.par_iter().zip(starts).for_each(|(s, mut st)| {
-        for x in s.iter() {
-            let p = part(x);
-            // SAFETY: every index in 0..acc is written exactly once.
-            unsafe { ptr.get().add(st[p]).write(*x) };
-            st[p] += 1;
-        }
-    });
-    // SAFETY: all `acc` slots were written above.
-    unsafe { out.set_len(acc) };
-    (out, off)
 }
