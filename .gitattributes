@@ -1,0 +1,4 @@
+* text=auto eol=lf
+*.sh text eol=lf
+# Fixtures are byte-exact test data (E20 deliberately holds \r\n lines).
+fixtures/** -text

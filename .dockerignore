@@ -1,0 +1,8 @@
+target/
+fixtures/
+dev/
+out/
+dev-answer/
+scripts/
+.git
+*.md
