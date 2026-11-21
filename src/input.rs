@@ -46,9 +46,9 @@ pub fn advise(data: &'static [u8], advice: i32) {
 #[cfg(target_os = "linux")]
 unsafe fn sys_madvise(addr: *mut u8, len: usize, advice: i32) {
     extern "C" {
-        fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     }
-    madvise(addr as *mut std::ffi::c_void, len, advice);
+    madvise(addr, len, advice);
 }
 
 #[cfg(not(target_os = "linux"))]

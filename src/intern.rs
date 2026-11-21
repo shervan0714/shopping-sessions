@@ -1,4 +1,4 @@
-//! A concurrent string interner for user IDs.
+//! A concurrent string interner, used only for "exotic" IDs (see idkey.rs).
 //!
 //! 1024 independently locked shards, each a hashbrown table of indices into a
 //! key vector. Keys are `&'static [u8]` slices of the memory-mapped inputs, so
@@ -83,29 +83,9 @@ impl Interner {
         ((s as u32) << LOCAL_BITS) | local
     }
 
-    /// Consume the interner: returns the dense key list and the per-shard
-    /// offsets that map a packed ID to its dense index.
-    pub fn finish(self) -> Dense {
-        let mut offsets = Vec::with_capacity(SHARDS);
-        let mut keys = Vec::new();
-        for m in self.shards {
-            let sh = m.into_inner().unwrap();
-            offsets.push(keys.len() as u32);
-            keys.extend_from_slice(&sh.keys);
-            std::mem::forget(sh.arena); // the key slices point into it
-        }
-        Dense { offsets, keys }
-    }
-}
-
-pub struct Dense {
-    pub offsets: Vec<u32>,
-    pub keys: Vec<&'static [u8]>,
-}
-
-impl Dense {
-    #[inline(always)]
-    pub fn index(&self, packed: u32) -> u32 {
-        self.offsets[(packed >> LOCAL_BITS) as usize] + (packed & LOCAL_MASK)
+    /// The bytes of an interned ID (slow path: takes the shard's lock).
+    pub fn bytes(&self, packed: u32) -> &'static [u8] {
+        let s = (packed >> LOCAL_BITS) as usize;
+        self.shards[s].lock().unwrap().keys[(packed & LOCAL_MASK) as usize]
     }
 }

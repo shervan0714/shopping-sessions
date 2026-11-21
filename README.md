@@ -49,16 +49,27 @@ diagnostics (stage timings) go to stderr. It needs no scratch space.
 | Stage | What | Complexity / memory |
 |---|---|---|
 | 1. map | `mmap` every CSV, cut bodies into ~4 MB line-aligned chunks. A background thread issues `MADV_WILLNEED` at most ~128 chunks ahead of the parsers; each parsed chunk is released with `MADV_DONTNEED`, so the inputs' page-cache footprint stays bounded. | O(files) |
-| 2. parse | Work-stealing over chunks on `NCPU` threads. A SIMD structural scanner (`src/scan.rs`, AVX2/SSE2 bitmasks for `\n`, `,`, `"`) finds fields in one pass; quote validity is checked by popcount (quotes in the line must equal 2 × wrapped fields), which is provably the same rule as the simple splitter in `src/csv.rs` and is fuzz-tested against it. Timestamps are parsed by hand (`src/ts.rs`). Events are validated (including the late check, which depends only on the copy itself) and appended to fixed 256-row blocks in one of 256 `event_id`-hash buckets. Valid clicks and link pairs are collected. User IDs are interned in a 1024-shard locked table whose entries carry an exact inline encoding of the key, so lookups do not dereference the input. | O(bytes); ~40 B per event row, 32 B per click |
-| 3. people | Union–find (union by size, path halving: no recursion, any chain length) over link pairs; each component is named by its byte-wise smallest ID. IDs that only appear in links are included. | O(links · α) |
-| 4. dedup | Per bucket, in parallel: sort by (hash, ingest_ts); in each equal-hash run keep the first (smallest ingest_ts) copy; it survives only if it was valid. 64-bit hash collisions between different event_ids are detected by comparing the bytes and regrouped exactly. | O(n log(n/256)) |
-| 5. group | Counting sort of surviving events and valid clicks by person (atomic counters + scatter). | O(n) |
-| 6. sessions | Per person, in parallel (work-stealing, so whale persons do not serialise the rest; huge persons sort in parallel): sort events by ts, cut sessions at gaps > 30 min (equal timestamps always share a session), day = UTC date of the start. Credit: binary search in the person's clicks sorted by (ts, click_id) for the last click with ts ≤ start, then the first click with that ts (smallest click_id), organic if none within 7 days. Assists: per campaign, the click intervals [ts, ts+7d] are merged and every session whose start falls in a merged interval is counted once, by binary search over the session starts and the person's day segments — O(clicks log clicks + intervals · (log sessions + days)), never sessions × clicks. top_category: highest purchase sum, ties to the byte-wise smallest name, `unknown` included. | O(events log events) per person |
-| 7. output | Parquet (plain, uncompressed, no dictionary), one `user_daily` file per thread written in parallel plus one `campaign_daily` file; `day` is INT32 `DATE`. | O(rows) |
+| 2. parse | Link files first (small), in parallel; then the people table is built on its own thread while all event and click chunks are parsed by work-stealing on `NCPU` threads. A SIMD structural scanner (`src/scan.rs`, AVX2/SSE2 bitmasks for `\n`, `,`, `"`) finds fields in one pass; quote validity is checked by popcount (quotes in the line must equal 2 × wrapped fields), which is provably the same rule as the simple splitter in `src/csv.rs` and is fuzz-tested against it. Timestamps: SWAR time-of-day plus a small per-thread memo of validated dates (`src/ts.rs`, fuzzed against the plain parser). **Every ID becomes an exact 64-bit key** (`src/idkey.rs`): 1–10 bytes of `[0-9A-Z_a-z]` are packed 6 bits per byte so that integer order is byte order and integer equality is string equality; any other ID is interned exactly and flagged, and comparisons involving it use the real bytes. No locks, hashing or string copies on the hot path. Events are validated (including the late check) and appended to fixed 2048-row blocks, one chain per `event_id`-key bucket (256), carved from per-worker huge-page arenas (`src/alloc.rs`). Products are looked up only for purchases. | O(bytes); 40 B per event row, 32 B per click |
+| 3. people | Union–find (union by size, path halving) over the linked IDs only; each component is named by its byte-wise smallest ID. The result is an open-addressing table linked-ID-key → person-key with a bit filter in front; every unlinked ID is its own person (`src/people.rs`). | O(links · α) |
+| 4. dedup | Per bucket, in parallel: the rows are split into 16 sub-buckets so each hash table (event key → copy with the smallest ingest_ts) stays in cache; kept copies are read back in row order, invalid/late ones dropped, and the person lookup is software-prefetched two stages ahead. Survivors are appended straight to per-thread block chains, one per person partition (256, by hash of the person key). Keys are exact, so there are no collisions to resolve. | O(n) |
+| 5. clicks | Valid clicks get their person key and are scattered into the same 256 person partitions. | O(clicks) |
+| 6. sessions | Per person partition, in parallel, largest first: group the events by person with a hash table, attach each person's clicks (clicks of persons with no events are dropped: they cannot credit or assist), sort each person's events by ts and clicks by (ts, click_id). Then sessions are cut at gaps > 30 min (equal timestamps always share a session), day = UTC date of the start. Credit: binary search for the last click with ts ≤ start, then the first click with that ts (smallest click_id), organic if none within 7 days. Assists: per campaign, the click intervals [ts, ts+7d] are merged and every session whose start falls in a merged interval is counted once, by binary search over the session starts and the person's day segments, never sessions × clicks. top_category: highest purchase sum, ties to the byte-wise smallest name, `unknown` included. | O(n log k), k = events per person |
+| 7. output | Parquet (plain, uncompressed, no dictionary), `user_daily` cut into ~4 files per thread written in parallel (names passed as zero-copy slices of one buffer per file) plus one `campaign_daily` file; `day` is INT32 `DATE`. | O(rows) |
 
 Click duplicates are not removed: rules.md guarantees copies are identical,
 and neither crediting (latest ts, then smallest id) nor assisting (distinct
 campaigns) changes when an identical row appears twice.
+
+## Credits
+
+All code here was written for this repo. Ideas we learned from other teams' public
+write-ups and then implemented our own way: order-preserving packed 64-bit ID keys,
+person partitions instead of a global sort, huge-page block arenas for partition
+buffers, links-first scheduling, and prefetched link-table lookups (from the public
+READMEs/notes of the `micah-andelman/shopping-sessions` and `jklein07/shopping-sessions`
+repositories, which credit further teams in turn). Papers and references that shaped
+the scanner: Langdale & Lemire, *Parsing Gigabytes of JSON per Second* (simdjson,
+arXiv:1902.08318), and the SIMD CSV work in `minio/simdcsv`.
 
 ## Correctness evidence
 
@@ -75,7 +86,8 @@ All of these were run, not assumed:
   no network, 64 MB tmpfs `/tmp`), passes all 36 fixtures and matches the dev
   answer.
 * Unit tests: every timestamp example and bad form from rules.md, the CSV
-  dialect cases, price parsing, inline-key exactness, and a 60 000-case fuzz of
+  dialect cases, price parsing, inline- and packed-key exactness and ordering, a 300 000-case fuzz of the SWAR
+  timestamp parser against the plain one, and a 60 000-case fuzz of
   the SIMD scanner against the simple splitter.
 
 ## Performance

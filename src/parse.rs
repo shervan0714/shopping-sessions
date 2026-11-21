@@ -3,7 +3,9 @@
 
 use crate::scan::scan;
 use crate::input::Lookups;
-use crate::intern::{self, Interner};
+use crate::idkey::{key, mix};
+use crate::alloc::Blocks;
+use crate::intern::Interner;
 use crate::ts::{self, DAY};
 
 pub const KIND_INVALID: u8 = 0;
@@ -27,54 +29,27 @@ pub const BLOCK: usize = 2048;
 /// an event takes part in dedup, valid or not; `kind == KIND_INVALID` marks a
 /// copy that fails validation (rules.md events steps 3-4: invalid or late),
 /// which is dropped only if dedup keeps it. The late check depends only on the
-/// copy's own ts and ingest_ts, so it is decided here.
-///
-/// Packed to 40 bytes: `ptr_cat` = event_id pointer (48 bits; x86-64 and
-/// arm64 user addresses fit) | category << 48; `price_kind` = price (24 bits,
-/// max 10,000,000 < 2^24) | kind << 24.
+/// copy's own ts and ingest_ts, so it is decided here. IDs are exact 64-bit
+/// keys (`idkey`). `price_kind` = price (24 bits, max 10,000,000 < 2^24) |
+/// kind << 24; `cat` is only set for purchases (only they feed top_category).
 #[derive(Clone, Copy)]
 pub struct EvRow {
-    pub h: u64,          // xxh3 of event_id
+    pub eid: u64,
     pub ingest: i64,     // ingest_ts
     pub ts: i64,         // ts (only meaningful when valid)
-    pub ptr_cat: u64,
-    pub user: u32,       // packed interned user_id (only when valid)
+    pub user: u64,       // user key (only when valid)
     pub price_kind: u32,
+    pub cat: u32,
 }
-
-const PTR_MASK: u64 = (1 << 48) - 1;
 
 impl EvRow {
     #[inline(always)]
     pub fn part(&self) -> usize {
-        (self.h >> (64 - EV_PART_BITS)) as usize
+        (mix(self.eid) >> (64 - EV_PART_BITS)) as usize
     }
     #[inline(always)]
     pub fn kind(&self) -> u8 {
         (self.price_kind >> 24) as u8
-    }
-    #[inline(always)]
-    pub fn price(&self) -> u32 {
-        self.price_kind & 0x00FF_FFFF
-    }
-    #[inline(always)]
-    pub fn cat(&self) -> u16 {
-        (self.ptr_cat >> 48) as u16
-    }
-    /// The event_id bytes. A value never holds `,` or `"`, and event_id is
-    /// the first of 7 fields, so it ends at the first `,` or `"` (closing
-    /// quote) after its start, which always exists within its line.
-    #[inline]
-    pub fn eid(&self) -> &'static [u8] {
-        let p = (self.ptr_cat & PTR_MASK) as *const u8;
-        let mut n = 0usize;
-        // SAFETY: the terminator lies inside the same, leaked input mapping.
-        unsafe {
-            while *p.add(n) != b',' && *p.add(n) != b'"' {
-                n += 1;
-            }
-            std::slice::from_raw_parts(p, n)
-        }
     }
 }
 
@@ -85,50 +60,80 @@ impl EvRow {
 #[derive(Clone, Copy)]
 pub struct ClickRow {
     pub ts: i64,
-    pub cid: usize,
-    pub cid_len: u32,
-    pub user: u32,
+    pub cid: u64,
+    pub user: u64,
     pub campaign: u32,
 }
 
 pub struct Ctx<'a> {
     pub lookups: &'a Lookups,
-    pub interner: &'a Interner,
+    pub exotic: &'a Interner,
     pub ws: i64,
     pub we: i64,
 }
 
 pub struct Worker {
-    /// Open block per event bucket.
-    pub open: Vec<Vec<EvRow>>,
+    /// Open block (and its fill) per event bucket; blocks come from a
+    /// per-worker huge-page arena.
+    open: Vec<*mut EvRow>,
+    open_len: Vec<u32>,
     /// Full blocks per event bucket.
-    pub full: Vec<Vec<Vec<EvRow>>>,
+    full: Vec<Vec<&'static [EvRow]>>,
+    arena: Blocks<EvRow>,
     pub n_events: usize,
     pub clicks: Vec<ClickRow>,
-    pub links: Vec<(u32, u32)>,
 }
+
+#[derive(Default)]
+pub struct LinkSink {
+    pub links: Vec<(u64, u64)>,
+}
+
+// SAFETY: the raw block pointers are owned by this worker alone.
+unsafe impl Send for Worker {}
 
 impl Worker {
     pub fn new() -> Self {
+        let mut arena = Blocks::new(BLOCK);
         Worker {
-            open: (0..EV_PARTS).map(|_| Vec::with_capacity(BLOCK)).collect(),
+            open: (0..EV_PARTS).map(|_| arena.take()).collect(),
+            open_len: vec![0; EV_PARTS],
             full: (0..EV_PARTS).map(|_| Vec::new()).collect(),
+            arena,
             n_events: 0,
             clicks: Vec::new(),
-            links: Vec::new(),
         }
     }
 
     #[inline(always)]
     fn push_event(&mut self, row: EvRow) {
         let p = row.part();
-        let open = &mut self.open[p];
-        open.push(row);
-        if open.len() == BLOCK {
-            let full = std::mem::replace(open, Vec::with_capacity(BLOCK));
-            self.full[p].push(full);
+        // SAFETY: p < EV_PARTS; the open block has room (it is replaced as
+        // soon as it fills).
+        unsafe {
+            let n = self.open_len.get_unchecked_mut(p);
+            let b = *self.open.get_unchecked(p);
+            b.add(*n as usize).write(row);
+            *n += 1;
+            if *n as usize == BLOCK {
+                self.full[p].push(std::slice::from_raw_parts(b, BLOCK));
+                *self.open.get_unchecked_mut(p) = self.arena.take();
+                *n = 0;
+            }
         }
         self.n_events += 1;
+    }
+
+    /// Every block of each bucket (full ones and the open one).
+    pub fn into_parts(self) -> (Vec<Vec<&'static [EvRow]>>, Vec<ClickRow>) {
+        let mut full = self.full;
+        for p in 0..EV_PARTS {
+            if self.open_len[p] > 0 {
+                // SAFETY: the first open_len rows of the open block are written.
+                full[p].push(unsafe { std::slice::from_raw_parts(self.open[p], self.open_len[p] as usize) });
+            }
+        }
+        (full, self.clicks)
     }
 }
 
@@ -156,19 +161,17 @@ pub fn events_chunk(chunk: &'static [u8], ctx: &Ctx, w: &mut Worker) {
         if eid.is_empty() {
             return;
         }
-        let h = intern::hash(eid);
-        let ptr = eid.as_ptr() as u64;
-        assert!(ptr <= PTR_MASK, "pointer does not fit in 48 bits");
+        let ek = key(eid, ctx.exotic);
         // ingest_ts is always valid F1 per the rules; if it ever is not, the
         // copy sorts last in dedup and is invalid if kept.
         let ingest = ts::parse(ingf);
         let mut row = EvRow {
-            h,
+            eid: ek,
             ingest: ingest.unwrap_or(i64::MAX),
             ts: 0,
-            ptr_cat: ptr,
             user: 0,
             price_kind: 0,
+            cat: 0,
         };
         if let Some(ing) = ingest {
             if !user.is_empty() && !product.is_empty() {
@@ -183,11 +186,12 @@ pub fn events_chunk(chunk: &'static [u8], ctx: &Ctx, w: &mut Worker) {
                     if let (Some(t), Some(p)) = (ts::parse(tsf), p) {
                         // In the event window, and not late (ingest - ts over 24 h).
                         if t >= ctx.ws && t < ctx.we && ing - t <= DAY {
-                            let cat = ctx.lookups.products.get(product).unwrap_or(ctx.lookups.unknown_category);
+                            if kind == KIND_PURCHASE {
+                                row.cat = ctx.lookups.products.get(product).unwrap_or(ctx.lookups.unknown_category) as u32;
+                            }
                             row.ts = t;
-                            row.ptr_cat = ptr | (cat as u64) << 48;
                             row.price_kind = p | (kind as u32) << 24;
-                            row.user = ctx.interner.intern(user);
+                            row.user = key(user, ctx.exotic);
                         }
                     }
                 }
@@ -211,23 +215,22 @@ pub fn clicks_chunk(chunk: &'static [u8], ctx: &Ctx, w: &mut Worker) {
         let Some(c) = ctx.lookups.campaigns.get(campaign) else { return };
         w.clicks.push(ClickRow {
             ts: t,
-            cid: cid.as_ptr() as usize,
-            cid_len: cid.len() as u32,
-            user: ctx.interner.intern(user),
+            cid: key(cid, ctx.exotic),
+            user: key(user, ctx.exotic),
             campaign: c,
         });
     });
 }
 
-pub fn links_chunk(chunk: &'static [u8], ctx: &Ctx, w: &mut Worker) {
+pub fn links_chunk(chunk: &'static [u8], ctx: &Ctx, links: &mut Vec<(u64, u64)>) {
     scan::<2>(chunk, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let a = ctx.interner.intern(f[0]);
-        let b = ctx.interner.intern(f[1]);
+        let a = key(f[0], ctx.exotic);
+        let b = key(f[1], ctx.exotic);
         if a != b {
-            w.links.push((a, b));
+            links.push((a, b));
         }
     });
 }
