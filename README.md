@@ -44,17 +44,19 @@ diagnostics (stage timings) go to stderr. It needs no scratch space.
 * No JVM / interpreter start-up, no query planning, tiny image, predictable
   memory. Spark alone spends seconds starting.
 
-## Architecture
+## Architecture (v0.2, `fast-pipeline` branch)
 
-| Stage | What | Complexity / memory |
-|---|---|---|
-| 1. map | `mmap` every CSV, cut bodies into ~4 MB line-aligned chunks. A background thread issues `MADV_WILLNEED` at most ~128 chunks ahead of the parsers; each parsed chunk is released with `MADV_DONTNEED`, so the inputs' page-cache footprint stays bounded. | O(files) |
-| 2. parse | Work-stealing over chunks on `NCPU` threads. A SIMD structural scanner (`src/scan.rs`, AVX2/SSE2 bitmasks for `\n`, `,`, `"`) finds fields in one pass; quote validity is checked by popcount (quotes in the line must equal 2 × wrapped fields), which is provably the same rule as the simple splitter in `src/csv.rs` and is fuzz-tested against it. Timestamps are parsed by hand (`src/ts.rs`). Events are validated (including the late check, which depends only on the copy itself) and appended to fixed 256-row blocks in one of 256 `event_id`-hash buckets. Valid clicks and link pairs are collected. User IDs are interned in a 1024-shard locked table whose entries carry an exact inline encoding of the key, so lookups do not dereference the input. | O(bytes); ~40 B per event row, 32 B per click |
-| 3. people | Union–find (union by size, path halving: no recursion, any chain length) over link pairs; each component is named by its byte-wise smallest ID. IDs that only appear in links are included. | O(links · α) |
-| 4. dedup | Per bucket, in parallel: sort by (hash, ingest_ts); in each equal-hash run keep the first (smallest ingest_ts) copy; it survives only if it was valid. 64-bit hash collisions between different event_ids are detected by comparing the bytes and regrouped exactly. | O(n log(n/256)) |
-| 5. group | Counting sort of surviving events and valid clicks by person (atomic counters + scatter). | O(n) |
-| 6. sessions | Per person, in parallel (work-stealing, so whale persons do not serialise the rest; huge persons sort in parallel): sort events by ts, cut sessions at gaps > 30 min (equal timestamps always share a session), day = UTC date of the start. Credit: binary search in the person's clicks sorted by (ts, click_id) for the last click with ts ≤ start, then the first click with that ts (smallest click_id), organic if none within 7 days. Assists: per campaign, the click intervals [ts, ts+7d] are merged and every session whose start falls in a merged interval is counted once, by binary search over the session starts and the person's day segments — O(clicks log clicks + intervals · (log sessions + days)), never sessions × clicks. top_category: highest purchase sum, ties to the byte-wise smallest name, `unknown` included. | O(events log events) per person |
-| 7. output | Parquet (plain, uncompressed, no dictionary), one `user_daily` file per thread written in parallel plus one `campaign_daily` file; `day` is INT32 `DATE`. | O(rows) |
+No crate dependencies (std only; Parquet is written by `src/pq.rs`).
+
+| Stage | What |
+|---|---|
+| 1. links | Parsed first. Both IDs go into a lock-free insert-only table (`src/utab.rs`, 32-byte slots, CAS publish) and are unioned with a concurrent union-find stored in the same slots. Each component's name is a lock-free minimum over its keys; every linked ID's slot then holds its person. |
+| 2. events + clicks | Line-at-a-time SIMD scanner (`scan_lines`: one 128-byte window gives newline/comma/quote masks). IDs pack into exact, order-preserving 128-bit keys (`src/key.rs`; >15 bytes go to a locked side interner). User and product lookups are batched 16 rows at a time behind prefetches; unknown users are inserted with themselves as person. Every event copy is scattered by event_id hash into P1 partitions (per-thread blocks in huge-page arenas); valid clicks are scattered by person into P2 partitions. |
+| 3. dedup | Per P1 partition, a cache-resident hash table keeps the smallest-ingest copy; surviving valid events are scattered by person into P2. |
+| 4. sessions | Per P2 partition (largest first): group by person (local hash + counting sort), sort each person's events/clicks, sessionize, credit (moving pointer), assists (merged 7-day intervals), aggregate. |
+| 5. output | One user_daily file per thread + one campaign_daily file, written in parallel. |
+
+If the user table passes 75 % load (only on data far from the generator's shape) the binary re-executes itself with a 4x larger table before writing anything.
 
 Click duplicates are not removed: rules.md guarantees copies are identical,
 and neither crediting (latest ts, then smallest id) nor assisting (distinct

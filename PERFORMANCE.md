@@ -1,5 +1,18 @@
 # Performance report
 
+## v0.2 (`fast-pipeline`) vs v0.1, same box, same data
+
+2-vCPU Xeon sandbox, seed 7, 5M events / 1.25M clicks (480 MB), warm page cache, best of 5:
+
+| | wall (NCPU=2) | CPU (user+sys) | wall (NCPU=1) |
+|---|---|---|---|
+| v0.1 | 2.27 s | 5.39 s | 3.74 s |
+| v0.2 | 1.04 s | 2.27 s | 1.65 s |
+
+Stage (NCPU=1) v0.1 → v0.2: parse 2.34 → 1.02 s, dedup 0.55 → 0.17 s, group+sessions 0.51 → 0.28 s, output 0.13 → 0.09 s.
+Outputs identical to v0.1 on seeds 2, 3, 4, 7, 15 (2028-02-29 window), 21 and on a long-ID variant; 36/36 fixtures; dev MATCH.
+
+
 Every number here was measured; nothing is extrapolated.
 
 ## Machine

@@ -4,7 +4,8 @@
 //! quotes around the whole field (`"..."`, with no `"` inside). Anything else,
 //! or the wrong number of fields, makes the whole line malformed.
 
-use memchr::{memchr, memchr_iter};
+fn memchr(c: u8, s: &[u8]) -> Option<usize> { s.iter().position(|&x| x == c) }
+fn memchr_iter(c: u8, s: &[u8]) -> impl Iterator<Item = usize> + '_ { s.iter().enumerate().filter(move |x| *x.1 == c).map(|x| x.0) }
 
 /// Split `line` into exactly `N` fields, removing syntactic quotes. Returns
 /// `false` for a malformed line (wrong field count, stray quote). An empty

@@ -211,3 +211,148 @@ mod tests {
         assert_eq!(via_scan::<7>(d).len(), 3);
     }
 }
+
+/// Line-at-a-time scanner: for each line, one 128-byte window gives the
+/// newline, comma and quote masks at once; the line end is the first newline
+/// bit, the N-1 commas must be exactly the comma bits before it, and quotes
+/// are validated by popcount as in `scan`. Lines that do not fit in the
+/// window, and the tail of the buffer where a 128-byte load is not allowed,
+/// fall back to `scan`. `readable_end` is one past the last byte that may be
+/// loaded (the end of the file mapping `data` lives in).
+#[inline(always)]
+pub fn scan_lines<'a, const N: usize>(data: &'a [u8], readable_end: *const u8, mut f: impl FnMut(&[&'a [u8]; N])) {
+    let base = data.as_ptr();
+    let n = data.len();
+    let mut s = 0usize;
+    while s < n {
+        // SAFETY: pointer arithmetic only; the load below is bounds-checked.
+        let p = unsafe { base.add(s) };
+        if (p as usize) + 128 > readable_end as usize {
+            break;
+        }
+        let (nl, cm, qt) = masks128(p);
+        if nl == 0 {
+            break; // a line of 128+ bytes: let the general scanner handle the rest
+        }
+        let len = nl.trailing_zeros() as usize;
+        if s + len >= n && s + len != n {
+            break; // (cannot happen for line-aligned chunks; be safe)
+        }
+        let below = (1u128 << len) - 1;
+        let mut c = cm & below;
+        let q = qt & below;
+        let line_end = s + len;
+        s = line_end + 1;
+        if c.count_ones() as usize != N - 1 {
+            continue;
+        }
+        let mut out: [&'a [u8]; N] = [&[]; N];
+        let mut a = line_end - len;
+        for k in 0..N - 1 {
+            let i = c.trailing_zeros() as usize;
+            c &= c - 1;
+            let e = line_end - len + i;
+            out[k] = &data[a..e];
+            a = e + 1;
+        }
+        out[N - 1] = &data[a..line_end];
+        if q != 0 {
+            let mut wrapped = 0u32;
+            for fld in out.iter_mut() {
+                let l = fld.len();
+                if l >= 2 && fld[0] == b'"' && fld[l - 1] == b'"' {
+                    wrapped += 1;
+                    *fld = &fld[1..l - 1];
+                }
+            }
+            if q.count_ones() != 2 * wrapped {
+                continue;
+            }
+        }
+        f(&out);
+    }
+    if s < n {
+        scan::<N>(&data[s..], f);
+    }
+}
+
+#[inline(always)]
+fn masks128(p: *const u8) -> (u128, u128, u128) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    unsafe {
+        use std::arch::x86_64::*;
+        let nlv = _mm256_set1_epi8(b'\n' as i8);
+        let cmv = _mm256_set1_epi8(b',' as i8);
+        let qtv = _mm256_set1_epi8(b'"' as i8);
+        let mut nl = 0u128;
+        let mut cm = 0u128;
+        let mut qt = 0u128;
+        for k in 0..4 {
+            let v = _mm256_loadu_si256(p.add(32 * k) as *const __m256i);
+            nl |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, nlv)) as u32 as u128) << (32 * k);
+            cm |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, cmv)) as u32 as u128) << (32 * k);
+            qt |= (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, qtv)) as u32 as u128) << (32 * k);
+        }
+        (nl, cm, qt)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    unsafe {
+        let b: &[u8; 128] = &*(p as *const [u8; 128]);
+        let (mut nl, mut cm, mut qt) = (0u128, 0u128, 0u128);
+        for (i, &c) in b.iter().enumerate() {
+            nl |= ((c == b'\n') as u128) << i;
+            cm |= ((c == b',') as u128) << i;
+            qt |= ((c == b'"') as u128) << i;
+        }
+        (nl, cm, qt)
+    }
+}
+
+#[cfg(test)]
+mod line_tests {
+    use super::*;
+    use crate::csv;
+
+    fn via_split<const N: usize>(data: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut v = Vec::new();
+        csv::for_each_line(data, |l| {
+            let mut f = [&b""[..]; N];
+            if csv::split(l, &mut f) {
+                v.push(f.iter().map(|x| x.to_vec()).collect());
+            }
+        });
+        v
+    }
+    fn via_lines<const N: usize>(data: &[u8], pad: usize) -> Vec<Vec<Vec<u8>>> {
+        // place data in a buffer with `pad` readable bytes after it
+        let mut buf = data.to_vec();
+        buf.extend(std::iter::repeat(b'x').take(pad));
+        let d = &buf[..data.len()];
+        let end = buf.as_ptr_range().end;
+        let mut v = Vec::new();
+        scan_lines::<N>(d, end, |f| v.push(f.iter().map(|x| x.to_vec()).collect()));
+        v
+    }
+
+    #[test]
+    fn fuzz_against_split() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for round in 0..60_000 {
+            let alphabet: &[u8] = if round % 3 == 0 { b"abcdefghijklmnopqrstuvwxyz0123456789,,,,\"\n" } else { b"abcdefgh,,,\"\"\n\n\r 1" };
+            let len = (round % 700) as usize;
+            let mut d = Vec::with_capacity(len);
+            for _ in 0..len {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                d.push(alphabet[(x % alphabet.len() as u64) as usize]);
+            }
+            // chunks end at a newline, as in the pipeline (or at the end)
+            for pad in [0usize, 5, 200] {
+                assert_eq!(via_lines::<2>(&d, pad), via_split::<2>(&d), "{:?}", String::from_utf8_lossy(&d));
+                assert_eq!(via_lines::<4>(&d, pad), via_split::<4>(&d));
+                assert_eq!(via_lines::<7>(&d, pad), via_split::<7>(&d));
+            }
+        }
+    }
+}
