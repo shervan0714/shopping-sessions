@@ -57,6 +57,63 @@ static DECODE: [u8; 64] = decode_table();
 /// Pack a 1..=10 byte `[0-9A-Z_a-z]` string; `None` otherwise.
 #[inline(always)]
 pub fn pack(b: &[u8]) -> Option<u64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"))]
+    {
+        let n = b.len();
+        // 16 bytes starting at b lie in b's page, so they can be read even
+        // past the end of b (the extra lanes are masked off).
+        if n.wrapping_sub(1) < 10 && (b.as_ptr() as usize & 4095) <= 4096 - 16 {
+            // SAFETY: the 16-byte read stays inside a mapped page (above).
+            return unsafe { pack_simd(b.as_ptr(), n) };
+        }
+    }
+    pack_scalar(b)
+}
+
+/// SIMD `pack` for 1..=10 bytes: classify all 16 lanes at once, then fold
+/// the 6-bit codes together with two multiply-add steps.
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "sse4.1"))]
+#[inline(always)]
+unsafe fn pack_simd(p: *const u8, n: usize) -> Option<u64> {
+    use std::arch::x86_64::*;
+    let v = _mm_loadu_si128(p as *const __m128i);
+    let lanes = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    let inlen = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), lanes);
+    let range = |lo: u8, span: u8| {
+        let d = _mm_sub_epi8(v, _mm_set1_epi8(lo as i8));
+        (d, _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(span as i8)), d))
+    };
+    let (d, is_d) = range(b'0', 9);
+    let (u, is_u) = range(b'A', 25);
+    let (l, is_l) = range(b'a', 25);
+    let is_us = _mm_cmpeq_epi8(v, _mm_set1_epi8(b'_' as i8));
+    let valid = _mm_or_si128(_mm_or_si128(is_d, is_u), _mm_or_si128(is_l, is_us));
+    if _mm_movemask_epi8(_mm_andnot_si128(valid, inlen)) != 0 {
+        return None;
+    }
+    let code = _mm_or_si128(
+        _mm_or_si128(
+            _mm_and_si128(is_d, _mm_add_epi8(d, _mm_set1_epi8(1))),
+            _mm_and_si128(is_u, _mm_add_epi8(u, _mm_set1_epi8(11))),
+        ),
+        _mm_or_si128(
+            _mm_and_si128(is_l, _mm_add_epi8(l, _mm_set1_epi8(38))),
+            _mm_and_si128(is_us, _mm_set1_epi8(37)),
+        ),
+    );
+    let code = _mm_and_si128(code, inlen);
+    // 16-bit lanes: c[2j] * 64 + c[2j+1]; 32-bit lanes: pairs of those * 4096.
+    let w = _mm_maddubs_epi16(code, _mm_set1_epi16(0x0140));
+    let q = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000));
+    let q0 = _mm_cvtsi128_si32(q) as u32 as u64;
+    let q1 = _mm_extract_epi32::<1>(q) as u32 as u64;
+    let q2 = _mm_extract_epi32::<2>(q) as u32 as u64;
+    Some((q0 << 36) | (q1 << 12) | (q2 >> 12))
+}
+
+/// Scalar `pack` (also the reference for the SIMD one).
+#[inline(always)]
+pub fn pack_scalar(b: &[u8]) -> Option<u64> {
     let n = b.len();
     if n == 0 || n > 10 {
         return None;
@@ -160,6 +217,36 @@ mod tests {
         }
         for bad in [&b""[..], b" u1", b"u1 ", b"u-1", b"u1\r", b"abcdefghijk", "é".as_bytes()] {
             assert_eq!(pack(bad), None);
+        }
+    }
+
+    #[test]
+    fn simd_pack_matches_scalar() {
+        // Random strings over valid and invalid bytes, lengths 0..=12, at
+        // every alignment (including next to a page end).
+        let alphabet = b"09AZaz_mQ5 -\r\xff\x80/:@[`{";
+        let mut x: u64 = 0xdead_beef_1234_5678;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut page = vec![0u8; 3 * 4096];
+        let base = (4096 - (page.as_ptr() as usize & 4095)) % 4096; // page-aligned offset
+        for _ in 0..400_000 {
+            let n = (rnd() % 13) as usize;
+            let off = base + (rnd() % 4096) as usize;
+            for i in 0..16 {
+                page[off + i] = alphabet[(rnd() % alphabet.len() as u64) as usize];
+            }
+            if rnd() % 3 == 0 {
+                for i in 0..n {
+                    page[off + i] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"[(rnd() % 63) as usize];
+                }
+            }
+            let s = &page[off..off + n];
+            assert_eq!(pack(s), pack_scalar(s), "{:?}", s);
         }
     }
 
