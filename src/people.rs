@@ -9,7 +9,7 @@
 
 use crate::idkey::{self, mix};
 use crate::intern::Interner;
-use hashbrown::HashMap;
+use crate::sys::FastMap;
 
 const EMPTY: u64 = u64::MAX;
 
@@ -95,7 +95,7 @@ impl UnionFind {
 impl People {
     pub fn build(links: &[Vec<(u64, u64)>], exotic: &Interner) -> People {
         let n_links: usize = links.iter().map(Vec::len).sum();
-        let mut index: HashMap<u64, u32> = HashMap::with_capacity(n_links + n_links / 2);
+        let mut index: FastMap<u64, u32> = FastMap::with_capacity_and_hasher(n_links + n_links / 2, Default::default());
         let mut ids: Vec<u64> = Vec::with_capacity(n_links + n_links / 2);
         let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(n_links);
         for v in links {

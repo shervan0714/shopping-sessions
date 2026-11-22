@@ -90,11 +90,6 @@ pub struct Worker {
     pub n_clicks: usize,
 }
 
-#[derive(Default)]
-pub struct LinkSink {
-    pub links: Vec<(u64, u64)>,
-}
-
 // SAFETY: the raw block pointers are owned by this worker alone.
 unsafe impl Send for Worker {}
 

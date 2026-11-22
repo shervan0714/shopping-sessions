@@ -1,6 +1,6 @@
 [package]
 name = "shopping-sessions"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
 
@@ -8,14 +8,9 @@ publish = false
 name = "shopping-sessions"
 path = "src/main.rs"
 
+# No dependencies: std only (scoped threads, a small Parquet writer, mmap via
+# libc symbols), so the build needs no crate downloads.
 [dependencies]
-memchr = "2"
-memmap2 = "0.9"
-rayon = "1"
-hashbrown = "0.15"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-parquet = { version = "53", default-features = false }
-bytes = "1"
 
 [profile.release]
 opt-level = 3

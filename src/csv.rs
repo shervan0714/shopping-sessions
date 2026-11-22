@@ -4,7 +4,7 @@
 //! quotes around the whole field (`"..."`, with no `"` inside). Anything else,
 //! or the wrong number of fields, makes the whole line malformed.
 
-use memchr::{memchr, memchr_iter};
+use crate::sys::{memchr, memchr_iter};
 
 /// Split `line` into exactly `N` fields, removing syntactic quotes. Returns
 /// `false` for a malformed line (wrong field count, stray quote). An empty

@@ -4,8 +4,7 @@
 use crate::csv;
 use crate::key::StaticMap;
 use crate::ts;
-use hashbrown::HashMap;
-use memmap2::{Advice, Mmap};
+use crate::sys::{self, FastMap as HashMap, FastSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,18 +19,12 @@ pub fn map_file(path: &Path) -> io::Result<&'static [u8]> {
 /// Like `map_file`, also returning the open file (leaked) for `pread`.
 pub fn map_open(path: &Path) -> io::Result<(&'static [u8], &'static File)> {
     let file: &'static File = Box::leak(Box::new(File::open(path)?));
-    if file.metadata()?.len() == 0 {
-        return Ok((&[], file));
-    }
-    // SAFETY: /data is read-only and nothing modifies the inputs while we run.
-    let map = unsafe { Mmap::map(file)? };
-    let _ = map.advise(Advice::Sequential);
-    let map: &'static Mmap = Box::leak(Box::new(map));
-    Ok((&map[..], file))
+    // /data is read-only and nothing modifies the inputs while we run.
+    Ok((sys::map_file(file)?, file))
 }
 
-pub const WILLNEED: i32 = 3;
-pub const DONTNEED: i32 = 4;
+pub const WILLNEED: i32 = sys::MADV_WILLNEED;
+pub const DONTNEED: i32 = sys::MADV_DONTNEED;
 
 /// `madvise` over the whole pages inside `data` (part of a leaked, read-only
 /// file mapping). Rounds inward so neighbouring chunks' pages are untouched.
@@ -39,25 +32,8 @@ pub const DONTNEED: i32 = 4;
 /// from our mapping (they refault transparently if read again). Both are
 /// hints: results never depend on them.
 pub fn advise(data: &'static [u8], advice: i32) {
-    const PAGE: usize = 4096;
-    let a = (data.as_ptr() as usize + PAGE - 1) & !(PAGE - 1);
-    let b = (data.as_ptr() as usize + data.len()) & !(PAGE - 1);
-    if b > a {
-        // SAFETY: [a, b) lies inside a live mapping; neither advice writes.
-        unsafe { sys_madvise(a as *mut u8, b - a, advice) };
-    }
+    sys::advise(data, advice);
 }
-
-#[cfg(target_os = "linux")]
-unsafe fn sys_madvise(addr: *mut u8, len: usize, advice: i32) {
-    extern "C" {
-        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
-    }
-    madvise(addr, len, advice);
-}
-
-#[cfg(not(target_os = "linux"))]
-unsafe fn sys_madvise(_addr: *mut u8, _len: usize, _advice: i32) {}
 
 /// Every `*.csv` regular file (or symlink to one) directly in `dir`, sorted.
 /// A missing directory holds no rows.
@@ -84,7 +60,7 @@ pub fn list_csv(dir: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// The rows of a file: everything after its first line (the header).
 pub fn body(data: &'static [u8]) -> &'static [u8] {
-    match memchr::memchr(b'\n', data) {
+    match sys::memchr(b'\n', data) {
         Some(i) => &data[i + 1..],
         None => &[], // empty file, or a header with no newline: no rows
     }
@@ -97,7 +73,7 @@ pub fn chunks(body: &'static [u8], target: usize, out: &mut Vec<&'static [u8]>) 
     while start < body.len() {
         let mut end = (start + target).min(body.len());
         if end < body.len() {
-            end = match memchr::memchr(b'\n', &body[end..]) {
+            end = match sys::memchr(b'\n', &body[end..]) {
                 Some(i) => end + i + 1,
                 None => body.len(),
             };
@@ -124,8 +100,8 @@ pub struct Lookups {
 pub fn load_lookups(data_dir: &Path) -> io::Result<Lookups> {
     let products_data = map_file(&data_dir.join("products.csv"))?;
     let mut products: Vec<(&'static [u8], u16)> = Vec::new();
-    let mut products_seen: hashbrown::HashSet<&'static [u8]> = hashbrown::HashSet::new();
-    let mut cat_index: HashMap<&'static [u8], u16> = HashMap::new();
+    let mut products_seen: FastSet<&'static [u8]> = FastSet::default();
+    let mut cat_index: HashMap<&'static [u8], u16> = HashMap::default();
     let mut categories: Vec<&'static [u8]> = Vec::new();
     let mut intern_cat = |name: &'static [u8], cats: &mut Vec<&'static [u8]>| -> u16 {
         *cat_index.entry(name).or_insert_with(|| {
@@ -152,7 +128,7 @@ pub fn load_lookups(data_dir: &Path) -> io::Result<Lookups> {
     }
 
     let campaigns_data = map_file(&data_dir.join("campaigns.csv"))?;
-    let mut campaigns = HashMap::new();
+    let mut campaigns: HashMap<&'static [u8], u32> = HashMap::default();
     let mut campaign_ids = Vec::new();
     let mut campaign_channels = Vec::new();
     csv::for_each_line(body(campaigns_data), |line| {

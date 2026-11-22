@@ -55,7 +55,7 @@ impl<V: Copy> StaticMap<V> {
         let mut slots = vec![None; cap];
         let mask = cap - 1;
         for &(k, v) in items {
-            let h = crate::intern::hash(k);
+            let h = crate::sys::hash_bytes(k);
             let mut i = h as usize & mask;
             loop {
                 match &slots[i] {
@@ -73,7 +73,7 @@ impl<V: Copy> StaticMap<V> {
 
     #[inline]
     pub fn get(&self, k: &[u8]) -> Option<V> {
-        let h = crate::intern::hash(k);
+        let h = crate::sys::hash_bytes(k);
         let p = pack(k);
         let mut i = h as usize & self.mask;
         loop {
