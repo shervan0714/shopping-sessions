@@ -7,6 +7,8 @@
 //! the system allocator. Both are hints only: without THP it is plain mmap.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::Mutex;
 
 const BIG: usize = 1 << 20;
 const HUGE: usize = 2 << 20;
@@ -68,16 +70,43 @@ fn unmap(p: *mut u8, len: usize) {
 
 pub struct Alloc;
 
+/// Big allocations are rounded up to a power of two (virtual size only:
+/// untouched pages cost nothing) so that a freed one can serve any later
+/// request of its class. Freed big buffers are kept per class and handed out
+/// again instead of being unmapped and faulted in fresh (dedup tables,
+/// grouping scratch and output columns of one stage feed the next).
+const CLASSES: usize = 48;
+static FREE: [Mutex<Vec<usize>>; CLASSES] = [const { Mutex::new(Vec::new()) }; CLASSES];
+
 #[inline(always)]
-fn rounded(size: usize) -> usize {
-    (size + 4095) & !4095
+fn class(size: usize) -> usize {
+    size.next_power_of_two().trailing_zeros() as usize
+}
+
+unsafe fn big_alloc(size: usize, zero: bool) -> *mut u8 {
+    let c = class(size);
+    if let Some(p) = FREE[c].lock().ok().and_then(|mut f| f.pop()) {
+        if zero {
+            std::ptr::write_bytes(p as *mut u8, 0, size);
+        }
+        return p as *mut u8;
+    }
+    map_huge(1usize << c) // fresh anonymous memory is zero
+}
+
+unsafe fn big_free(p: *mut u8, size: usize) {
+    let c = class(size);
+    match FREE[c].lock() {
+        Ok(mut f) => f.push(p as usize),
+        Err(_) => unmap(p, 1 << c),
+    }
 }
 
 unsafe impl GlobalAlloc for Alloc {
     #[inline]
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         if l.size() >= BIG && l.align() <= HUGE {
-            map_huge(rounded(l.size()))
+            big_alloc(l.size(), false)
         } else {
             System.alloc(l)
         }
@@ -85,7 +114,7 @@ unsafe impl GlobalAlloc for Alloc {
     #[inline]
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         if l.size() >= BIG && l.align() <= HUGE {
-            map_huge(rounded(l.size())) // fresh anonymous memory is zero
+            big_alloc(l.size(), true)
         } else {
             System.alloc_zeroed(l)
         }
@@ -93,7 +122,7 @@ unsafe impl GlobalAlloc for Alloc {
     #[inline]
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         if l.size() >= BIG && l.align() <= HUGE {
-            unmap(p, rounded(l.size()))
+            big_free(p, l.size())
         } else {
             System.dealloc(p, l)
         }
@@ -101,6 +130,10 @@ unsafe impl GlobalAlloc for Alloc {
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
         if l.size() < BIG && new_size < BIG {
             return System.realloc(p, l, new_size);
+        }
+        // Still in the same big class: the mapping already has room.
+        if l.size() >= BIG && new_size >= BIG && l.align() <= HUGE && class(l.size()) == class(new_size) {
+            return p;
         }
         let nl = Layout::from_size_align_unchecked(new_size, l.align());
         let q = self.alloc(nl);
@@ -114,6 +147,8 @@ unsafe impl GlobalAlloc for Alloc {
 
 /// Rows appended to `n` partitions, each a chain of arena blocks.
 pub struct Parts<T: 'static> {
+    /// Rows pushed so far.
+    pub count: usize,
     open: Vec<*mut T>,
     len: Vec<u32>,
     full: Vec<Vec<&'static [T]>>,
@@ -125,6 +160,7 @@ unsafe impl<T: 'static> Send for Parts<T> {}
 impl<T: Copy + 'static> Parts<T> {
     pub fn new(n: usize, block: usize) -> Self {
         Parts {
+            count: 0,
             open: vec![std::ptr::null_mut(); n],
             len: vec![0; n],
             full: (0..n).map(|_| Vec::new()).collect(),
@@ -144,6 +180,7 @@ impl<T: Copy + 'static> Parts<T> {
             }
             o.add(*n as usize).write(x);
             *n += 1;
+            self.count += 1;
             if *n as usize == block {
                 self.full[p].push(std::slice::from_raw_parts(*o, block));
                 *o = std::ptr::null_mut();
@@ -165,15 +202,40 @@ impl<T: Copy + 'static> Parts<T> {
 }
 
 /// Every row block is one `POOL_BLOCK`-byte slot. Slots freed by one stage
-/// (event blocks after dedup) are reused by the next (survivor blocks), so
-/// that stage writes into memory that is already mapped instead of faulting
-/// in and zeroing fresh pages.
+/// (event blocks after dedup, survivor and click blocks once a person
+/// partition is grouped) are reused by the next (survivor blocks, user rows),
+/// so later stages write into memory that is already mapped instead of
+/// faulting in and zeroing fresh pages.
+///
+/// One pool per worker thread (`par::tid`), so a worker puts and takes its
+/// own slots without contention; a worker whose pool is empty tries the
+/// others (non-blocking) before mapping fresh memory.
 pub const POOL_BLOCK: usize = 81920;
-static POOL: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+const NPOOL: usize = 64;
+static POOLS: [Mutex<Vec<usize>>; NPOOL] = [const { Mutex::new(Vec::new()) }; NPOOL];
+/// Slots in all pools (approximate): skip the scan when there are none.
+static POOLED: AtomicUsize = AtomicUsize::new(0);
 
-/// Return a slot (the start of a block) to the pool.
+/// Return a slot (the start of a block) to this worker's pool.
 pub fn pool_put(p: *const u8) {
-    POOL.lock().unwrap().push(p as usize);
+    POOLS[crate::par::tid() % NPOOL].lock().unwrap().push(p as usize);
+    POOLED.fetch_add(1, Relaxed);
+}
+
+fn pool_take() -> Option<usize> {
+    if POOLED.load(Relaxed) == 0 {
+        return None;
+    }
+    let t = crate::par::tid() % NPOOL;
+    for i in 0..NPOOL {
+        let q = &POOLS[(t + i) % NPOOL];
+        let got = if i == 0 { q.lock().ok().and_then(|mut g| g.pop()) } else { q.try_lock().ok().and_then(|mut g| g.pop()) };
+        if let Some(x) = got {
+            POOLED.fetch_sub(1, Relaxed);
+            return Some(x);
+        }
+    }
+    None
 }
 
 /// A bump allocator of fixed-size row blocks carved from huge-page regions
@@ -198,7 +260,7 @@ impl<T> Blocks<T> {
     }
     #[inline]
     pub fn take(&mut self) -> *mut T {
-        if let Some(p) = POOL.lock().unwrap().pop() {
+        if let Some(p) = pool_take() {
             return p as *mut T;
         }
         if self.left == 0 {

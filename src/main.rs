@@ -218,17 +218,20 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     // parsers, but at most RA_AHEAD chunks (~512 MB) ahead, so the inputs'
     // page-cache footprint stays bounded. A hint only; never needed for
     // correctness.
-    if std::env::var_os("SS_NO_READAHEAD").is_none() {
+    let readahead = std::env::var_os("SS_NO_READAHEAD").is_none().then(|| {
         const RA_AHEAD: usize = 128;
         std::thread::spawn(move || {
             for (i, &(_, chunk, _, _)) in tasks.iter().enumerate() {
                 while i > next.load(Relaxed) + RA_AHEAD {
+                    if next.load(Relaxed) >= tasks.len() {
+                        return; // parsing finished
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
                 input::advise(chunk, input::WILLNEED);
             }
-        });
-    }
+        })
+    });
 
     // ---- 2. parse ---------------------------------------------------------
     let exotic = intern::Interner::new();
@@ -250,6 +253,23 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     });
     let people = people_cell.wait();
     drop(link_vecs);
+    // The inputs are fully parsed (IDs are packed or copied into the
+    // interner; products and campaigns have their own mappings). Unmap them
+    // on a background thread, after the readahead thread has stopped, so the
+    // page-table teardown overlaps the remaining stages instead of adding to
+    // process exit.
+    if std::env::var_os("SS_KEEP_MAPS").is_none() {
+        let maps: Vec<&'static [u8]> = mapped.iter().map(|m| m.1).collect();
+        std::thread::spawn(move || {
+            if let Some(h) = readahead {
+                let _ = h.join();
+            }
+            for m in maps {
+                // SAFETY: nothing reads the input mappings after parsing.
+                unsafe { sys::unmap(m) };
+            }
+        });
+    }
     let n_ev_rows: usize = workers.iter().map(|w| w.n_events).sum();
     let n_clicks: usize = workers.iter().map(|w| w.n_clicks).sum();
     log(t0, &format!("parsed: {n_ev_rows} event rows, {n_clicks} valid clicks, {n_links} links"));
@@ -336,7 +356,7 @@ fn finish<T: Pack>(st: Stage) -> Result<(), Error> {
     };
     std::fs::create_dir_all(&uw.dir)?;
     let write_err: Mutex<Option<Error>> = Mutex::new(None);
-    let accs: Vec<Acc<T>>;
+    let mut accs: Vec<Acc<T>>;
     {
         let cl_parts = &cl_parts;
         // Largest partitions first, so no big one starts last.
@@ -348,6 +368,14 @@ fn finish<T: Pack>(st: Stage) -> Result<(), Error> {
         let states = par::each(order.len(), |_| (Acc::<T>::new((ncamp + 1) * ndays), Group::<T>::default()), |(acc, g), oi| {
             let p = order[oi];
             group_partition(&ev_parts[p], &cl_parts[p], g);
+            // Grouping copied this partition's rows: its blocks are dead, so
+            // they go back to this worker's pool (user rows reuse them).
+            for b in &ev_parts[p] {
+                alloc::pool_put(b.as_ptr() as *const u8);
+            }
+            for b in &cl_parts[p] {
+                alloc::pool_put(b.as_ptr() as *const u8);
+            }
             let Group { persons, ev_off, evs, cl_off, cls: gcls, .. } = g;
             for (pi, &person) in persons.iter().enumerate() {
                 let e = &mut evs[ev_off[pi] as usize..ev_off[pi + 1] as usize];
@@ -360,10 +388,13 @@ fn finish<T: Pack>(st: Stage) -> Result<(), Error> {
                 process_person(person, e, &ck, acc, &sctx);
                 acc.ck = ck;
             }
-            let flush = (acc.users.len() >= USER_FLUSH).then(|| std::mem::take(&mut acc.users));
-            if let Some(rows) = flush {
-                if let Err(e) = uw.write(&rows, exotic) {
+            if acc.users.count >= USER_FLUSH {
+                let blocks = acc.take_users();
+                if let Err(e) = uw.write(&blocks, exotic) {
                     *write_err.lock().unwrap() = Some(e);
+                }
+                for b in &blocks {
+                    alloc::pool_put(b.as_ptr() as *const u8);
                 }
             }
         });
@@ -375,7 +406,7 @@ fn finish<T: Pack>(st: Stage) -> Result<(), Error> {
     log(t0, "sessions done");
 
     // ---- 6. output -------------------------------------------------------------
-    write_outputs(out_dir, &accs, exotic, lookups, &sctx, ncamp, &uw)?;
+    write_outputs(out_dir, &mut accs, exotic, lookups, &sctx, ncamp, &uw)?;
     log(t0, "outputs written");
     Ok(())
 }
@@ -724,19 +755,26 @@ struct Acc<T> {
     camp: Vec<[i64; 4]>,
     /// The current person's packed clicks.
     ck: Vec<T>,
-    users: Vec<UserRow>,
+    /// User rows, in pool blocks (reusing dead partition blocks).
+    users: alloc::Parts<UserRow>,
     starts: Vec<i64>,
     segs: Vec<(usize, u32)>, // (day index, first session index)
     cats: Vec<(u32, i64)>,
     tmp: Vec<(u32, i64)>,
 }
 
+const USER_BLOCK: usize = alloc::POOL_BLOCK / std::mem::size_of::<UserRow>();
+
 impl<T> Acc<T> {
+    /// The user rows so far (as blocks); starts a new chain.
+    fn take_users(&mut self) -> Vec<&'static [UserRow]> {
+        std::mem::replace(&mut self.users, alloc::Parts::new(1, USER_BLOCK)).finish().pop().unwrap_or_default()
+    }
     fn new(slots: usize) -> Self {
         Acc {
             camp: vec![[0; 4]; slots],
             ck: Vec::new(),
-            users: Vec::new(),
+            users: alloc::Parts::new(1, USER_BLOCK),
             starts: Vec::new(),
             segs: Vec::new(),
             cats: Vec::new(),
@@ -808,7 +846,7 @@ fn process_person<T: Pack>(p: u64, evs: &[T], cls: &[T], acc: &mut Acc<T>, cx: &
         let day = start.div_euclid(DAY);
         if day != cur_day {
             if d_sessions > 0 {
-                users.push(UserRow {
+                users.push(0, UserRow {
                     person: p,
                     day: cur_day as i32,
                     sessions: d_sessions,
@@ -852,7 +890,7 @@ fn process_person<T: Pack>(p: u64, evs: &[T], cls: &[T], acc: &mut Acc<T>, cx: &
         i = j;
     }
     if d_sessions > 0 {
-        users.push(UserRow {
+        users.push(0, UserRow {
             person: p,
             day: cur_day as i32,
             sessions: d_sessions,
@@ -947,25 +985,27 @@ struct UserWriter {
 }
 
 impl UserWriter {
-    fn write(&self, rows: &[UserRow], exotic: &intern::Interner) -> Result<(), Error> {
+    fn write(&self, blocks: &[&[UserRow]], exotic: &intern::Interner) -> Result<(), Error> {
+        let n: usize = blocks.iter().map(|b| b.len()).sum();
+        let rows = || blocks.iter().flat_map(|b| b.iter());
         let i = self.files.fetch_add(1, Relaxed);
         // Names go into one buffer, handed to Parquet as zero-copy slices.
-        let mut buf = Vec::with_capacity(rows.len() * 10);
-        let mut ends = Vec::with_capacity(rows.len());
-        for r in rows.iter() {
+        let mut buf = Vec::with_capacity(n * 10);
+        let mut ends = Vec::with_capacity(n);
+        for r in rows() {
             idkey::write(r.person, exotic, &mut buf);
             ends.push(buf.len());
         }
         let mut c = output::UserCols {
-            user_id: Vec::with_capacity(rows.len()),
-            day: Vec::with_capacity(rows.len()),
-            sessions: Vec::with_capacity(rows.len()),
-            events: Vec::with_capacity(rows.len()),
-            revenue: Vec::with_capacity(rows.len()),
-            top: Vec::with_capacity(rows.len()),
+            user_id: Vec::with_capacity(n),
+            day: Vec::with_capacity(n),
+            sessions: Vec::with_capacity(n),
+            events: Vec::with_capacity(n),
+            revenue: Vec::with_capacity(n),
+            top: Vec::with_capacity(n),
         };
         let mut start = 0;
-        for (r, &end) in rows.iter().zip(&ends) {
+        for (r, &end) in rows().zip(&ends) {
             c.user_id.push(&buf[start..end]);
             start = end;
             c.day.push(r.day);
@@ -984,7 +1024,7 @@ const USER_FLUSH: usize = 1 << 18;
 
 fn write_outputs<T>(
     out_dir: &Path,
-    accs: &[Acc<T>],
+    accs: &mut [Acc<T>],
     exotic: &intern::Interner,
     lookups: &Lookups,
     cx: &SessCtx,
@@ -998,7 +1038,7 @@ fn write_outputs<T>(
     let ndays = cx.ndays;
     let slots = (ncamp + 1) * ndays;
     let mut camp = vec![[0i64; 4]; slots];
-    for a in accs {
+    for a in accs.iter() {
         for (x, y) in camp.iter_mut().zip(&a.camp) {
             for f in 0..4 {
                 x[f] += y[f];
@@ -1034,15 +1074,31 @@ fn write_outputs<T>(
     // user_daily: the rows are cut into ~4 pieces per thread, one file each,
     // written in parallel. Names are written into one buffer per piece and
     // handed to Parquet as zero-copy slices of it.
-    let total: usize = accs.iter().map(|a| a.users.len()).sum();
+    let total: usize = accs.iter().map(|a| a.users.count).sum();
     let piece = total.div_ceil(4 * par::threads()).max(1 << 14);
-    let mut pieces: Vec<&[UserRow]> = accs.iter().flat_map(|a| a.users.chunks(piece)).collect();
+    // Each piece: consecutive blocks of one thread's chain, ~`piece` rows.
+    let mut pieces: Vec<Vec<&[UserRow]>> = Vec::new();
+    for a in accs.iter_mut() {
+        let mut cur: Vec<&[UserRow]> = Vec::new();
+        let mut rows = 0;
+        for b in a.take_users() {
+            rows += b.len();
+            cur.push(b);
+            if rows >= piece {
+                pieces.push(std::mem::take(&mut cur));
+                rows = 0;
+            }
+        }
+        if !cur.is_empty() {
+            pieces.push(cur);
+        }
+    }
     if pieces.is_empty() && uw.files.load(Relaxed) == 0 {
-        pieces.push(&[]); // an empty user_daily still gets one (empty) file
+        pieces.push(Vec::new()); // an empty user_daily still gets one (empty) file
     }
     // Item 0 is campaign_daily, the rest are user_daily pieces.
     let errs = par::each(pieces.len() + 1, |_| Vec::<Error>::new(), |errs, i| {
-        let r = if i == 0 { output::write_campaign(&cd.join("part-00000.parquet"), &cc) } else { uw.write(pieces[i - 1], exotic) };
+        let r = if i == 0 { output::write_campaign(&cd.join("part-00000.parquet"), &cc) } else { uw.write(&pieces[i - 1], exotic) };
         if let Err(e) = r {
             errs.push(e);
         }

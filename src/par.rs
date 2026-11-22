@@ -6,6 +6,16 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 static THREADS: AtomicUsize = AtomicUsize::new(1);
 
+thread_local! {
+    static TID: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// This worker's index within its stage (0 on the main thread).
+#[inline]
+pub fn tid() -> usize {
+    TID.with(|t| t.get())
+}
+
 pub fn set_threads(n: usize) {
     THREADS.store(n.max(1), Relaxed);
 }
@@ -21,7 +31,14 @@ pub fn run<R: Send>(n: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
     }
     std::thread::scope(|s| {
         let f = &f;
-        let hs: Vec<_> = (1..n).map(|t| s.spawn(move || f(t))).collect();
+        let hs: Vec<_> = (1..n)
+            .map(|t| {
+                s.spawn(move || {
+                    TID.with(|c| c.set(t));
+                    f(t)
+                })
+            })
+            .collect();
         let first = f(0);
         let mut out = Vec::with_capacity(n);
         out.push(first);
