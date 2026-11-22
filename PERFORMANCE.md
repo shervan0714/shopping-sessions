@@ -67,9 +67,10 @@ than this laptop. That ratio is an estimate, not a measurement.
 
 ### Memory and disk
 
-* Anonymous working memory ≈ 40 B per event row (huge-page block arenas, kept
-  until exit) + 24 B per surviving event (person-partition blocks) + 2 × 32 B
-  per valid click. 20M: max RSS 3.7 GB *including* ~1.9 GB of mapped input pages.
+* Anonymous working memory ≈ 24 B dedup record + 16 B payload per event row
+  (huge-page block arenas; record blocks are recycled after dedup) + 2 × 32 B
+  per valid click + per-worker logs of exotic IDs (16 B per long event ID,
+  32 B per long user/click ID occurrence) until they are verified. 20M: max RSS 3.7 GB *including* ~1.9 GB of mapped input pages.
 * Expected 60M peak on the scorer: ~6 GB anonymous + the inputs' page cache
   (5.8 GB), under 24 GB. Not measured on a 24 GB machine (see Limitations).
 * `/scratch` is not used.
@@ -99,6 +100,8 @@ than this laptop. That ratio is an estimate, not a measurement.
 
 | **Round 4:** static glibc (`+crt-static`), PGO (rustc 1.85.1, profile from the 20M set, dev and fixtures), plus a Cascade Lake build chosen at startup by CPUID | 15 interleaved runs each: dynamic median 1.90 s, static 1.87 s, static+PGO 1.82 s; minimums 1.57–1.62 s. No difference beyond noise here; kept because neither can change results and both may help on the scorer |
 | Tried, not kept: 512 / 1024 person partitions (`PP_BITS` 9 / 10); `mallopt` (mmap threshold 1 MB, trim 1 GB, top pad 64 MB, 16 arenas) | 10 interleaved runs, median: base 1.82 s, 512 1.81 s, 1024 2.02 s, mallopt 1.84 s |
+| **Round 5 (Nov 21 generator: 1 in 8 IDs has a 32-char hex suffix, so ~12 % of IDs miss the packed path):** exotic IDs keyed by a 62-bit hash with a second 64-bit hash in per-worker logs, verified collision-free after parsing (restart on the locked interner if not); no locks while parsing | emulated new data, 5M events, 2 vCPU, 9 interleaved runs: CPU 2.79 → 2.11 s, parse 0.92 → 0.62 s (the locked interner was the whole slowdown: old-style data parses in 0.53 s) |
+| Dedup on 24-byte records (event_id key, ingest_ts, payload pointer); payloads written once while parsing, straight into person partitions (users in no link need no lookup; the rest are resolved in prefetched batches once the people table is built); dropped copies marked dead in place | same data, median of 5: 1 thread dedup 0.35 → 0.13 s, total 2.39 → 1.91 s; 2 threads dedup 0.17 → 0.075 s, total 1.14 → 0.99 s; peak RSS +12 % |
 
 Profiles were taken with `perf record --call-graph fp`. The biggest wins
 came from removing dependent cache misses (key bytes in the mmapped input),
@@ -129,8 +132,13 @@ not from arithmetic.
 * `ingest_ts` is assumed valid F1 as rules.md guarantees; an unparsable one is
   treated as the latest copy and invalid if kept.
 * IDs outside the packed alphabet/length ("exotic": spaces, `\r`, non-ASCII,
-  over 10 bytes) take a slower locked-interner path. The fixtures exercise it;
-  the generator never produces such IDs, so its speed at scale is untested.
+  over 10 bytes; since Nov 21 about 1 in 8 generator IDs) are keyed by hash and
+  verified after parsing (src/intern.rs). A key collision is caught for sure
+  unless the second hash collides too (~1e-25 at 10M long IDs) and then the run
+  restarts on the exact locked interner; `SS_HASH_BITS=3` forces that path for
+  tests. Round 5 was measured on emulated new-generator data (the old
+  generator plus the hex suffix, as rules.md describes it), not on the real
+  one: check its ID lengths with `scripts/id_lengths.sh`.
 * Timings are from a noisy 15 W laptop (±15–30 % run to run, worse when hot);
   round 3 decisions were made from `perf` CPU profiles rather than wall time; the first run after a
   pause is often much slower because WSL has to re-read the inputs.

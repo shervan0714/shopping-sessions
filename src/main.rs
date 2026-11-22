@@ -282,7 +282,8 @@ fn run_with<T: Pack>(data_dir: &Path, out_dir: &Path, t0: Instant, ws: i64, we: 
     // stages read (intern.rs), while the inputs are still mapped.
     if !exotic.is_locked() {
         let (n_ev, n_names) = exotic.verify_all(&mut logs.iter_mut().collect::<Vec<_>>())?;
-        log(t0, &format!("exotic IDs verified: {n_ev} event IDs, {n_names} distinct user/click IDs"));
+        let pct = 100.0 * n_ev as f64 / n_ev_rows.max(1) as f64;
+        log(t0, &format!("exotic IDs verified: {n_ev} event IDs ({pct:.1}% of event rows), {n_names} distinct user/click IDs"));
     }
     drop(logs);
 
