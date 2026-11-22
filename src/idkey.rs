@@ -7,12 +7,13 @@
 //! byte-wise string order and integer equality equals string equality.
 //!
 //! Every other non-empty ID ("exotic": longer, or with any other byte such as
-//! a space, `\r` or non-ASCII) is interned exactly and gets
-//! `EXOTIC | interned id`. A packable string is always packed, so a packed key
-//! and an exotic key are never the same string. Ordering involving an exotic
-//! key compares the real bytes (`cmp`).
+//! a space, `\r` or non-ASCII) gets `EXOTIC | key bits` from intern.rs: a
+//! 62-bit hash, verified collision-free after parsing (or, after a collision,
+//! an exactly interned index). A packable string is always packed, so a packed
+//! key and an exotic key are never the same string. Ordering involving an
+//! exotic key compares the real bytes (`cmp`).
 
-use crate::intern::Interner;
+use crate::intern::{IdLog, Interner};
 use std::cmp::Ordering;
 
 pub const EXOTIC: u64 = 1 << 63;
@@ -147,12 +148,13 @@ pub fn unpack(k: u64, out: &mut [u8; 10]) -> usize {
     n
 }
 
-/// Key of a non-empty ID: packed, or interned exactly.
+/// Key of a non-empty ID: packed, or an exotic key (intern.rs). `NAME`:
+/// a user or click ID, whose bytes are kept (an event ID's are not).
 #[inline(always)]
-pub fn key(b: &[u8], exotic: &Interner) -> u64 {
+pub fn key<const NAME: bool>(b: &[u8], exotic: &Interner, log: &mut IdLog) -> u64 {
     match pack(b) {
         Some(k) => k,
-        None => EXOTIC | exotic.intern(b) as u64,
+        None => EXOTIC | exotic.key::<NAME>(b, log),
     }
 }
 
@@ -166,13 +168,13 @@ pub fn cmp(a: u64, b: u64, exotic: &Interner) -> Ordering {
         let n = unpack(a, &mut ba);
         &ba[..n]
     } else {
-        exotic.bytes(a as u32)
+        exotic.bytes(a)
     };
     let sb: &[u8] = if b & EXOTIC == 0 {
         let n = unpack(b, &mut bb);
         &bb[..n]
     } else {
-        exotic.bytes(b as u32)
+        exotic.bytes(b)
     };
     sa.cmp(sb)
 }
@@ -184,7 +186,7 @@ pub fn write(k: u64, exotic: &Interner, out: &mut Vec<u8>) {
         let n = unpack(k, &mut buf);
         out.extend_from_slice(&buf[..n]);
     } else {
-        out.extend_from_slice(exotic.bytes(k as u32));
+        out.extend_from_slice(exotic.bytes(k));
     }
 }
 
@@ -252,18 +254,56 @@ mod tests {
 
     #[test]
     fn exotic_keys() {
-        let ex = Interner::new();
-        let a = key(b"u1 ", &ex);
-        let b = key(b" u1", &ex);
-        let c = key(b"u1", &ex);
-        assert_ne!(a, b);
-        assert_eq!(a, key(b"u1 ", &ex));
-        assert_eq!(cmp(b, c, &ex), (&b" u1"[..]).cmp(&b"u1"[..]));
-        assert_eq!(cmp(a, c, &ex), (&b"u1 "[..]).cmp(&b"u1"[..]));
-        assert_eq!(cmp(c, a, &ex), (&b"u1"[..]).cmp(&b"u1 "[..]));
-        let mut out = Vec::new();
-        write(a, &ex, &mut out);
-        write(c, &ex, &mut out);
-        assert_eq!(out, b"u1 u1");
+        for locked in [false, true] {
+            let ex = Interner::with_mode(locked);
+            let mut log = IdLog::new();
+            let a = key::<true>(b"u1 ", &ex, &mut log);
+            let b = key::<true>(b" u1", &ex, &mut log);
+            let c = key::<true>(b"u1", &ex, &mut log);
+            let d = key::<true>(b"u5fstpucv1829340564ab6c7d8e9f0a1b2c3d4", &ex, &mut log);
+            assert_ne!(a, b);
+            assert_eq!(a, key::<true>(b"u1 ", &ex, &mut log));
+            assert!(a & EXOTIC != 0 && c & EXOTIC == 0 && a != u64::MAX && d != u64::MAX);
+            ex.verify_all(&mut [&mut log]).unwrap();
+            assert_eq!(cmp(b, c, &ex), (&b" u1"[..]).cmp(&b"u1"[..]));
+            assert_eq!(cmp(a, c, &ex), (&b"u1 "[..]).cmp(&b"u1"[..]));
+            assert_eq!(cmp(c, a, &ex), (&b"u1"[..]).cmp(&b"u1 "[..]));
+            assert_eq!(cmp(d, a, &ex), (&b"u5fstpucv1829340564ab6c7d8e9f0a1b2c3d4"[..]).cmp(&b"u1 "[..]));
+            let mut out = Vec::new();
+            write(a, &ex, &mut out);
+            write(c, &ex, &mut out);
+            write(d, &ex, &mut out);
+            assert_eq!(out, b"u1 u1u5fstpucv1829340564ab6c7d8e9f0a1b2c3d4");
+        }
+    }
+
+    #[test]
+    fn hash_collisions_are_detected() {
+        // With 4 hash bits, 200 different IDs must collide.
+        let ex = Interner::with_mode_bits(false, 4);
+        let mut log = IdLog::new();
+        for i in 0..200 {
+            let s = format!("user number {i}");
+            key::<true>(s.as_bytes(), &ex, &mut log);
+        }
+        assert!(ex.verify_all(&mut [&mut log]).is_err());
+        let ex = Interner::with_mode_bits(false, 4);
+        let mut log = IdLog::new();
+        for i in 0..200 {
+            let s = format!("event number {i}");
+            key::<false>(s.as_bytes(), &ex, &mut log);
+        }
+        assert!(ex.verify_all(&mut [&mut log]).is_err());
+        // The same IDs seen many times never collide with themselves.
+        let ex = Interner::with_mode(false);
+        let mut log = IdLog::new();
+        for _ in 0..3 {
+            for i in 0..5000 {
+                let s = format!("event number {i}");
+                key::<false>(s.as_bytes(), &ex, &mut log);
+                key::<true>(s.as_bytes(), &ex, &mut log);
+            }
+        }
+        assert!(ex.verify_all(&mut [&mut log]).is_ok());
     }
 }

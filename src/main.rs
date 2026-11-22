@@ -106,7 +106,16 @@ fn main() {
         .filter(|&n| n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from));
     par::set_threads(ncpu);
-    match run(&data_dir, &out_dir, t0) {
+    intern::configure();
+    let mut result = run(&data_dir, &out_dir, t0);
+    if matches!(&result, Err(e) if e.is::<intern::Collision>()) {
+        // Two different exotic IDs share a hash key (intern.rs): redo the
+        // run with the exact locked interner. Nothing has been written yet.
+        log(t0, "exotic ID hash collision: restarting with the locked interner");
+        intern::force_locked();
+        result = run(&data_dir, &out_dir, t0);
+    }
+    match result {
         Ok(()) => {
             log(t0, "done");
             // Skip freeing gigabytes of heap and unmapping inputs one by one.
@@ -219,9 +228,16 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     // Links first (small), so the people table can be built on its own
     // thread while the events and clicks are parsed.
     let n_link_tasks = tasks.iter().take_while(|t| t.0 == 2).count();
-    let link_vecs: Vec<Vec<(u64, u64)>> =
-        par::each(n_link_tasks, |_| Vec::new(), |v, i| parse::links_chunk(tasks[i].1, &pctx, v));
+    let link_states: Vec<(Vec<(u64, u64)>, intern::IdLog)> = par::each(
+        n_link_tasks,
+        |_| (Vec::new(), intern::IdLog::new()),
+        |(v, l), i| parse::links_chunk(tasks[i].1, &pctx, v, l),
+    );
     next.store(n_link_tasks, Relaxed);
+    let (link_vecs, mut link_logs): (Vec<Vec<(u64, u64)>>, Vec<intern::IdLog>) = link_states.into_iter().unzip();
+    // The people table orders link IDs by their bytes: check the links'
+    // exotic IDs and publish their names first (small: links only).
+    exotic.verify_links(&mut link_logs.iter_mut().collect::<Vec<_>>())?;
     let n_links: usize = link_vecs.iter().map(Vec::len).sum();
     let workers = std::thread::scope(|sc| {
         sc.spawn(|| {
@@ -231,8 +247,36 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     });
     let people = people_cell.wait();
     drop(link_vecs);
-    // The inputs are fully parsed (IDs are packed or copied into the
-    // interner; products and campaigns have their own mappings). Unmap them
+    let n_ev_rows: usize = workers.iter().map(|w| w.n_events).sum();
+    let n_clicks: usize = workers.iter().map(|w| w.n_clicks).sum();
+    log(t0, &format!("parsed: {n_ev_rows} event rows, {n_clicks} valid clicks, {n_links} links"));
+    log(t0, &format!("people: {} linked ids, {} merged into another person", people.n_ids, people.n_merged));
+
+    // ---- 3. regroup worker output ---------------------------------------------
+    let (ev_parts_n, pp) = (parse::ev_parts(), people::pp());
+    let mut buckets: Vec<Vec<&'static [EvRow]>> = (0..ev_parts_n).map(|_| Vec::new()).collect();
+    let mut cl_parts: Vec<Vec<&'static [ClickRow]>> = (0..pp).map(|_| Vec::new()).collect();
+    let mut logs = link_logs;
+    for w in workers {
+        let (blocks, clicks, ids) = w.into_parts();
+        for (p, b) in blocks.into_iter().enumerate() {
+            buckets[p].extend(b);
+        }
+        for (p, b) in clicks.into_iter().enumerate() {
+            cl_parts[p].extend(b);
+        }
+        logs.push(ids);
+    }
+    // Check every exotic ID key for collisions and copy the names that later
+    // stages read (intern.rs), while the inputs are still mapped.
+    if !exotic.is_locked() {
+        let (n_ev, n_names) = exotic.verify_all(&mut logs.iter_mut().collect::<Vec<_>>())?;
+        log(t0, &format!("exotic IDs verified: {n_ev} event IDs, {n_names} distinct user/click IDs"));
+    }
+    drop(logs);
+
+    // The inputs are fully parsed (IDs are packed, or verified and their
+    // names copied; products and campaigns have their own mappings). Unmap them
     // on a background thread, after the readahead thread has stopped, so the
     // page-table teardown overlaps the remaining stages instead of adding to
     // process exit.
@@ -247,24 +291,6 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
                 unsafe { sys::unmap(m) };
             }
         });
-    }
-    let n_ev_rows: usize = workers.iter().map(|w| w.n_events).sum();
-    let n_clicks: usize = workers.iter().map(|w| w.n_clicks).sum();
-    log(t0, &format!("parsed: {n_ev_rows} event rows, {n_clicks} valid clicks, {n_links} links"));
-    log(t0, &format!("people: {} linked ids, {} merged into another person", people.n_ids, people.n_merged));
-
-    // ---- 3. regroup worker output ---------------------------------------------
-    let (ev_parts_n, pp) = (parse::ev_parts(), people::pp());
-    let mut buckets: Vec<Vec<&'static [EvRow]>> = (0..ev_parts_n).map(|_| Vec::new()).collect();
-    let mut cl_parts: Vec<Vec<&'static [ClickRow]>> = (0..pp).map(|_| Vec::new()).collect();
-    for w in workers {
-        let (blocks, clicks) = w.into_parts();
-        for (p, b) in blocks.into_iter().enumerate() {
-            buckets[p].extend(b);
-        }
-        for (p, b) in clicks.into_iter().enumerate() {
-            cl_parts[p].extend(b);
-        }
     }
 
     // ---- 4.. dedup, sessions and output on packed rows (pack.rs) -----------
@@ -460,6 +486,7 @@ fn parse_all(
                         }
                     }
                 };
+                w.ids.set_chunk(data.as_ptr(), chunk.as_ptr());
                 match k {
                     0 => parse::events_chunk(data, pctx, &mut w),
                     _ => parse::clicks_chunk(data, pctx, &mut w),

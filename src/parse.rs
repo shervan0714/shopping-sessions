@@ -6,7 +6,7 @@ use crate::input::Lookups;
 use crate::idkey::{key, mix};
 use crate::alloc::{Blocks, Parts, POOL_BLOCK};
 use crate::people::{pp, ppart, PeopleSlot};
-use crate::intern::Interner;
+use crate::intern::{IdLog, Interner};
 use crate::ts::{self, DAY};
 
 pub const KIND_INVALID: u8 = 0;
@@ -94,6 +94,8 @@ pub struct Worker {
     /// Valid clicks, already in person partitions.
     pub clicks: Parts<ClickRow>,
     pub n_clicks: usize,
+    /// The exotic IDs this worker saw (intern.rs).
+    pub ids: IdLog,
 }
 
 // SAFETY: the raw block pointers are owned by this worker alone.
@@ -112,6 +114,7 @@ impl Worker {
             n_events: 0,
             clicks: Parts::new(pp(), POOL_BLOCK / std::mem::size_of::<ClickRow>()),
             n_clicks: 0,
+            ids: IdLog::new(),
         }
     }
 
@@ -135,7 +138,7 @@ impl Worker {
     }
 
     /// Every block of each bucket (full ones and the open one).
-    pub fn into_parts(self) -> (Vec<Vec<&'static [EvRow]>>, Vec<Vec<&'static [ClickRow]>>) {
+    pub fn into_parts(self) -> (Vec<Vec<&'static [EvRow]>>, Vec<Vec<&'static [ClickRow]>>, IdLog) {
         let mut full = self.full;
         for p in 0..self.open.len() {
             if self.open_len[p] > 0 {
@@ -143,7 +146,7 @@ impl Worker {
                 full[p].push(unsafe { std::slice::from_raw_parts(self.open[p], self.open_len[p] as usize) });
             }
         }
-        (full, self.clicks.finish())
+        (full, self.clicks.finish(), self.ids)
     }
 }
 
@@ -171,7 +174,7 @@ pub fn events_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
         if eid.is_empty() {
             return;
         }
-        let ek = key(eid, ctx.exotic);
+        let ek = key::<false>(eid, ctx.exotic, &mut w.ids);
         // ingest_ts is always valid F1 per the rules; if it ever is not, the
         // copy sorts last in dedup and is invalid if kept.
         let ingest = ts::parse(ingf);
@@ -201,7 +204,7 @@ pub fn events_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
                             }
                             row.ts = t;
                             row.price_kind = p | (kind as u32) << 24;
-                            row.user = key(user, ctx.exotic);
+                            row.user = key::<true>(user, ctx.exotic, &mut w.ids);
                         }
                     }
                 }
@@ -242,7 +245,9 @@ pub fn clicks_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
             return;
         }
         let Some(c) = ctx.lookups.campaigns.get(campaign) else { return };
-        buf[nb] = ClickRow { ts: t, cid: key(cid, ctx.exotic), user: key(user, ctx.exotic), campaign: c };
+        let cid = key::<true>(cid, ctx.exotic, &mut w.ids);
+        let user = key::<true>(user, ctx.exotic, &mut w.ids);
+        buf[nb] = ClickRow { ts: t, cid, user, campaign: c };
         nb += 1;
         if nb == BATCH {
             flush(&buf, w);
@@ -252,13 +257,15 @@ pub fn clicks_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
     flush(&buf[..nb], w);
 }
 
-pub fn links_chunk(chunk: &[u8], ctx: &Ctx, links: &mut Vec<(u64, u64)>) {
+/// Links of one chunk (parsed straight from the mapping) into `links`.
+pub fn links_chunk(chunk: &[u8], ctx: &Ctx, links: &mut Vec<(u64, u64)>, log: &mut IdLog) {
+    log.set_chunk(chunk.as_ptr(), chunk.as_ptr());
     scan::<2>(chunk, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;
         }
-        let a = key(f[0], ctx.exotic);
-        let b = key(f[1], ctx.exotic);
+        let a = key::<true>(f[0], ctx.exotic, log);
+        let b = key::<true>(f[1], ctx.exotic, log);
         if a != b {
             links.push((a, b));
         }
