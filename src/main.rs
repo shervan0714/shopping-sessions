@@ -326,6 +326,8 @@ fn finish<T: Pack>(st: Stage) -> Result<(), Error> {
         rank: &lookups.category_rank,
         ws,
         cbase: ws - WEEK,
+        // SS_SMALL_CLICKS overrides (0 / huge force either assist path, for tests).
+        small_clicks: std::env::var("SS_SMALL_CLICKS").ok().and_then(|v| v.parse().ok()).unwrap_or(16),
     };
     let uw = UserWriter {
         dir: out_dir.join("user_daily"),
@@ -702,6 +704,8 @@ struct SessCtx<'a> {
     /// Bases of the packed event and click timestamps.
     ws: i64,
     cbase: i64,
+    /// People with at most this many clicks take the direct assist path.
+    small_clicks: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -744,10 +748,15 @@ impl<T> Acc<T> {
 /// The click credited with a session starting at `s` (rules.md clicks step
 /// 4): among clicks with `s - 7d <= ts <= s`, the latest ts, then the
 /// smallest click_id. `cls` is packed and in (ts, click_id) order; `s` is
-/// relative to the click base.
+/// relative to the click base. Sessions come in increasing start order, so
+/// `cp` (the number of clicks with ts <= the previous start) only moves
+/// forward: one pass over the clicks for all of a person's sessions.
 #[inline]
-fn credit<T: Pack>(cls: &[T], s: u64, organic: u32) -> u32 {
-    let ub = cls.partition_point(|c| c.click_ts() <= s);
+fn credit<T: Pack>(cls: &[T], s: u64, organic: u32, cp: &mut usize) -> u32 {
+    while *cp < cls.len() && cls[*cp].click_ts() <= s {
+        *cp += 1;
+    }
+    let ub = *cp;
     if ub == 0 {
         return organic;
     }
@@ -755,7 +764,11 @@ fn credit<T: Pack>(cls: &[T], s: u64, organic: u32) -> u32 {
     if s - t > WEEK as u64 {
         return organic;
     }
-    let lb = cls[..ub].partition_point(|c| c.click_ts() < t);
+    // First of the run of clicks at ts t: the smallest click_id.
+    let mut lb = ub - 1;
+    while lb > 0 && cls[lb - 1].click_ts() == t {
+        lb -= 1;
+    }
     cls[lb].click_campaign()
 }
 
@@ -783,6 +796,7 @@ fn process_person<T: Pack>(p: u64, evs: &[T], cls: &[T], acc: &mut Acc<T>, cx: &
     let (mut d_sessions, mut d_events, mut d_revenue) = (0u32, 0u32, 0i64);
     let n = evs.len();
     let mut i = 0;
+    let mut cp = 0usize;
     while i < n {
         // A new session starts when the gap to the previous event is over 30
         // minutes; equal timestamps have gap 0 and always stay together.
@@ -829,7 +843,7 @@ fn process_person<T: Pack>(p: u64, evs: &[T], cls: &[T], acc: &mut Acc<T>, cx: &
         d_events += (j - i) as u32;
         d_revenue += rev;
 
-        let c = credit(cls, (start - cx.cbase) as u64, cx.organic);
+        let c = credit(cls, (start - cx.cbase) as u64, cx.organic, &mut cp);
         let slot = &mut camp[c as usize * ndays + (day - cx.day0) as usize];
         slot[0] += 1;
         slot[1] += purchased as i64;
@@ -857,24 +871,50 @@ fn process_person<T: Pack>(p: u64, evs: &[T], cls: &[T], acc: &mut Acc<T>, cx: &
     if cls.is_empty() {
         return;
     }
+    let nsess = starts.len();
+    // Few clicks (most people): slide a 7-day window over the clicks with
+    // the sessions (both in time order) and count each distinct campaign in
+    // a session's window once. O(sessions * w^2) with w <= small_clicks.
+    if cls.len() <= cx.small_clicks {
+        let (mut lo, mut hi) = (0usize, 0usize);
+        for &s in starts.iter() {
+            let srel = (s - cx.cbase) as u64;
+            while hi < cls.len() && cls[hi].click_ts() <= srel {
+                hi += 1;
+            }
+            while lo < hi && cls[lo].click_ts() + (WEEK as u64) < srel {
+                lo += 1;
+            }
+            let d = (s.div_euclid(DAY) - cx.day0) as usize;
+            for a in lo..hi {
+                let c = cls[a].click_campaign();
+                if !cls[lo..a].iter().any(|x| x.click_campaign() == c) {
+                    camp[c as usize * ndays + d][3] += 1;
+                }
+            }
+        }
+        return;
+    }
     tmp.clear();
     tmp.extend(cls.iter().map(|c| (c.click_campaign(), cx.cbase + c.click_ts() as i64)));
     tmp.sort_unstable();
-    let nsess = starts.len();
     let mut add_range = |c: u32, a: i64, b: i64| {
         let lo = starts.partition_point(|&s| s < a);
         let hi = starts.partition_point(|&s| s <= b);
         if lo >= hi {
             return;
         }
-        for k in 0..segs.len() {
+        // Start at the day segment holding session `lo`, stop once a
+        // segment starts at or after `hi`.
+        let mut k = segs.partition_point(|sg| (sg.1 as usize) <= lo) - 1;
+        while k < segs.len() && (segs[k].1 as usize) < hi {
             let s = segs[k].1 as usize;
             let e = if k + 1 < segs.len() { segs[k + 1].1 as usize } else { nsess };
-            let from = s.max(lo);
-            let to = e.min(hi);
+            let (from, to) = (s.max(lo), e.min(hi));
             if from < to {
                 camp[c as usize * ndays + segs[k].0][3] += (to - from) as i64;
             }
+            k += 1;
         }
     };
     let m = tmp.len();
