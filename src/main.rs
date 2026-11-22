@@ -20,6 +20,7 @@ mod input;
 mod intern;
 mod key;
 mod output;
+mod pack;
 mod par;
 mod parse;
 mod people;
@@ -29,7 +30,7 @@ mod sys;
 mod ts;
 
 use input::Lookups;
-use parse::{ClickRow, EvRow, Worker, KIND_PURCHASE};
+use parse::{ClickRow, EvRow, Worker};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
@@ -47,14 +48,15 @@ const WEEK: i64 = 7 * DAY;
 const CHUNK: usize = 512 << 10;
 const NO_CATEGORY: u32 = u32::MAX;
 
-/// A surviving event, tagged with its person key.
+/// A surviving event, tagged with its person key; `w` is the packed event
+/// (pack.rs).
 #[derive(Clone, Copy)]
-struct Surv {
+struct Surv<T> {
     person: u64,
-    ts: i64,
-    price_kind: u32,
-    cat: u32,
+    w: T,
 }
+
+use pack::Pack;
 
 use people::ppart;
 
@@ -267,16 +269,45 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
         }
     }
 
+    // ---- 4.. dedup, sessions and output on packed rows (pack.rs) -----------
+    let st = Stage { buckets, cl_parts, people, exotic: &exotic, lookups: &lookups, ws, we, out_dir, t0 };
+    // SS_WIDE=1 forces the general u128 layout (to test it).
+    if pack::narrow_fits(ws, we, lookups.categories.len(), WEEK) && std::env::var_os("SS_WIDE").is_none() {
+        finish::<u64>(st)
+    } else {
+        log(t0, "wide window or many categories: u128 rows");
+        finish::<u128>(st)
+    }
+}
+
+/// Everything the stages after parsing need.
+struct Stage<'a> {
+    buckets: Vec<Vec<&'static [EvRow]>>,
+    cl_parts: Vec<Vec<&'static [ClickRow]>>,
+    people: &'a people::People,
+    exotic: &'a intern::Interner,
+    lookups: &'a Lookups,
+    ws: i64,
+    we: i64,
+    out_dir: &'a Path,
+    t0: Instant,
+}
+
+/// Dedup, sessions, attribution, aggregation and output, with events and
+/// clicks packed as `T` words.
+fn finish<T: Pack>(st: Stage) -> Result<(), Error> {
+    let Stage { buckets, cl_parts, people, exotic, lookups, ws, we, out_dir, t0 } = st;
+    let pp = people::pp();
     // ---- 4. dedup events -----------------------------------------------------
     // Survivors go straight into per-thread block chains, one per person
     // partition (no intermediate array, no second scatter pass).
     let writers = par::each(
-        ev_parts_n,
-        |_| (alloc::Parts::<Surv>::new(pp, alloc::POOL_BLOCK / std::mem::size_of::<Surv>()), 0usize),
-        |(out, n), p| *n += dedup(&buckets[p], people, out),
+        buckets.len(),
+        |_| (alloc::Parts::<Surv<T>>::new(pp, alloc::POOL_BLOCK / std::mem::size_of::<Surv<T>>()), 0usize),
+        |(out, n), p| *n += dedup(&buckets[p], people, ws, out),
     );
     let n_surv: usize = writers.iter().map(|w| w.1).sum();
-    let mut ev_parts: Vec<Vec<&'static [Surv]>> = (0..pp).map(|_| Vec::new()).collect();
+    let mut ev_parts: Vec<Vec<&'static [Surv<T>]>> = (0..pp).map(|_| Vec::new()).collect();
     for (w, _) in writers {
         for (p, b) in w.finish().into_iter().enumerate() {
             ev_parts[p].extend(b);
@@ -284,9 +315,7 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     }
     log(t0, &format!("dedup: {n_surv} surviving events"));
 
-    // ---- 5. partition by person -----------------------------------------------
-
-    // ---- 6. sessions, attribution, aggregation ------------------------------
+    // ---- 5. sessions, attribution, aggregation ------------------------------
     let day0 = ws.div_euclid(DAY);
     let ndays = if we > ws { ((we - 1).div_euclid(DAY) - day0 + 1) as usize } else { 0 };
     let ncamp = lookups.campaign_ids.len();
@@ -295,6 +324,8 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
         ndays,
         organic: ncamp as u32,
         rank: &lookups.category_rank,
+        ws,
+        cbase: ws - WEEK,
     };
     let uw = UserWriter {
         dir: out_dir.join("user_daily"),
@@ -303,7 +334,7 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     };
     std::fs::create_dir_all(&uw.dir)?;
     let write_err: Mutex<Option<Error>> = Mutex::new(None);
-    let accs: Vec<Acc>;
+    let accs: Vec<Acc<T>>;
     {
         let cl_parts = &cl_parts;
         // Largest partitions first, so no big one starts last.
@@ -311,23 +342,21 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
         let ev_len: Vec<usize> = ev_parts.iter().map(|v| v.iter().map(|b| b.len()).sum()).collect();
         order.sort_unstable_by_key(|&p| std::cmp::Reverse(ev_len[p]));
         let ev_parts = &ev_parts;
-        let exotic = &exotic;
         let order = &order;
-        accs = par::each(order.len(), |_| Acc::new((ncamp + 1) * ndays), |acc, oi| {
+        let states = par::each(order.len(), |_| (Acc::<T>::new((ncamp + 1) * ndays), Group::<T>::default()), |(acc, g), oi| {
             let p = order[oi];
-            let mut g = GROUP.with(|c| std::mem::take(&mut *c.borrow_mut()));
-            group_partition(&ev_parts[p], &cl_parts[p], &mut g);
-            let Group { persons, ev_off, evs, cl_off, cls: gcls, .. } = &mut g;
+            group_partition(&ev_parts[p], &cl_parts[p], g);
+            let Group { persons, ev_off, evs, cl_off, cls: gcls, .. } = g;
             for (pi, &person) in persons.iter().enumerate() {
                 let e = &mut evs[ev_off[pi] as usize..ev_off[pi + 1] as usize];
                 let c = &mut gcls[cl_off[pi] as usize..cl_off[pi + 1] as usize];
                 if e.len() > 1 {
-                    e.sort_unstable_by_key(|x| x.ts);
+                    e.sort_unstable();
                 }
-                if c.len() > 1 {
-                    c.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| idkey::cmp(x.cid, y.cid, exotic)));
-                }
-                process_person(person, e, c, acc, &sctx);
+                pack_clicks(c, &mut acc.ck, sctx.cbase, exotic);
+                let ck = std::mem::take(&mut acc.ck);
+                process_person(person, e, &ck, acc, &sctx);
+                acc.ck = ck;
             }
             let flush = (acc.users.len() >= USER_FLUSH).then(|| std::mem::take(&mut acc.users));
             if let Some(rows) = flush {
@@ -335,18 +364,35 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
                     *write_err.lock().unwrap() = Some(e);
                 }
             }
-            GROUP.with(|c| *c.borrow_mut() = g);
         });
+        accs = states.into_iter().map(|s| s.0).collect();
     }
     if let Some(e) = write_err.into_inner().unwrap() {
         return Err(e);
     }
     log(t0, "sessions done");
 
-    // ---- 7. output -------------------------------------------------------------
-    write_outputs(out_dir, &accs, &exotic, &lookups, &sctx, ncamp, &uw)?;
+    // ---- 6. output -------------------------------------------------------------
+    write_outputs(out_dir, &accs, exotic, lookups, &sctx, ncamp, &uw)?;
     log(t0, "outputs written");
     Ok(())
+}
+
+/// A person's clicks as packed words in (ts, click_id) order. Sorting the
+/// words orders by ts then campaign; only when two clicks share a ts does
+/// click_id decide (credit takes the smallest), so then the rows themselves
+/// are sorted by (ts, click_id) and packed in that order.
+fn pack_clicks<T: Pack>(c: &mut [ClickRow], out: &mut Vec<T>, cbase: i64, exotic: &intern::Interner) {
+    out.clear();
+    out.extend(c.iter().map(|x| T::click((x.ts - cbase) as u64, x.campaign)));
+    if out.len() > 1 {
+        out.sort_unstable();
+        if out.windows(2).any(|w| w[0].click_ts() == w[1].click_ts()) {
+            c.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| idkey::cmp(x.cid, y.cid, exotic)));
+            out.clear();
+            out.extend(c.iter().map(|x| T::click((x.ts - cbase) as u64, x.campaign)));
+        }
+    }
 }
 
 /// (kind, chunk of the mapping, its file, offset of the chunk in the file)
@@ -407,22 +453,36 @@ fn parse_all(
 }
 
 /// One person partition grouped by person (reused per-thread scratch).
-#[derive(Default)]
-struct Group {
+struct Group<T> {
     table: Vec<(u64, u32)>,
     persons: Vec<u64>,
     pidx: Vec<u32>,
     ev_off: Vec<u32>,
-    evs: Vec<Surv>,
+    evs: Vec<T>,
     cpidx: Vec<u32>,
     cl_off: Vec<u32>,
     cls: Vec<ClickRow>,
 }
 
+impl<T> Default for Group<T> {
+    fn default() -> Self {
+        Group {
+            table: Vec::new(),
+            persons: Vec::new(),
+            pidx: Vec::new(),
+            ev_off: Vec::new(),
+            evs: Vec::new(),
+            cpidx: Vec::new(),
+            cl_off: Vec::new(),
+            cls: Vec::new(),
+        }
+    }
+}
+
 /// Group a partition's events by person with a hash table (persons in first
 /// seen order) and attach each person's clicks; clicks of persons with no
 /// event are dropped (they cannot credit or assist anything).
-fn group_partition(blocks: &[&'static [Surv]], cls: &[&'static [ClickRow]], g: &mut Group) {
+fn group_partition<T: Pack>(blocks: &[&'static [Surv<T>]], cls: &[&'static [ClickRow]], g: &mut Group<T>) {
     const EMPTY: u64 = u64::MAX;
     let n: usize = blocks.iter().map(|b| b.len()).sum();
     let cap = (2 * n).next_power_of_two().max(16);
@@ -486,7 +546,7 @@ fn group_partition(blocks: &[&'static [Surv]], cls: &[&'static [ClickRow]], g: &
             for e in b.iter() {
                 let pi = g.pidx[i] as usize;
                 // SAFETY: every slot in 0..n is written exactly once.
-                unsafe { out.add(pos[pi] as usize).write(*e) };
+                unsafe { out.add(pos[pi] as usize).write(e.w) };
                 pos[pi] += 1;
                 i += 1;
             }
@@ -538,7 +598,6 @@ struct DedupScratch {
 }
 
 thread_local! {
-    static GROUP: std::cell::RefCell<Group> = std::cell::RefCell::new(Group::default());
     static DEDUP: std::cell::RefCell<DedupScratch> = std::cell::RefCell::new(DedupScratch::default());
 }
 
@@ -547,7 +606,7 @@ thread_local! {
 /// Buckets are sized (~40K rows) so one open-addressing table (event_id key
 /// -> row) per bucket stays cache-resident. Rows stay in their blocks (row
 /// index = block << 11 | offset).
-fn dedup(blocks: &[&'static [EvRow]], people: &people::People, out: &mut alloc::Parts<Surv>) -> usize {
+fn dedup<T: Pack>(blocks: &[&'static [EvRow]], people: &people::People, ws: i64, out: &mut alloc::Parts<Surv<T>>) -> usize {
     const EMPTY: u64 = u64::MAX;
     const _: () = assert!(parse::BLOCK == 1 << 11);
     let row = |i: u32| -> &EvRow { &blocks[(i >> 11) as usize][(i & 2047) as usize] };
@@ -622,7 +681,8 @@ fn dedup(blocks: &[&'static [EvRow]], people: &people::People, out: &mut alloc::
             }
             let r = row(sc.keep[a]);
             let person = people.person(r.user);
-            out.push(ppart(person), Surv { person, ts: r.ts, price_kind: r.price_kind, cat: r.cat });
+            let w = T::ev((r.ts - ws) as u64, r.price_kind & 0x00FF_FFFF, r.cat);
+            out.push(ppart(person), Surv { person, w });
         }
         kept += n;
         // This bucket's event blocks are dead now: recycle them for the
@@ -639,6 +699,9 @@ struct SessCtx<'a> {
     ndays: usize,
     organic: u32,
     rank: &'a [u32],
+    /// Bases of the packed event and click timestamps.
+    ws: i64,
+    cbase: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -652,9 +715,11 @@ struct UserRow {
 }
 
 /// Per-thread accumulator plus reusable scratch buffers.
-struct Acc {
+struct Acc<T> {
     /// [sessions, purchasing_sessions, revenue, assisted] per (campaign, day)
     camp: Vec<[i64; 4]>,
+    /// The current person's packed clicks.
+    ck: Vec<T>,
     users: Vec<UserRow>,
     starts: Vec<i64>,
     segs: Vec<(usize, u32)>, // (day index, first session index)
@@ -662,10 +727,11 @@ struct Acc {
     tmp: Vec<(u32, i64)>,
 }
 
-impl Acc {
+impl<T> Acc<T> {
     fn new(slots: usize) -> Self {
         Acc {
             camp: vec![[0; 4]; slots],
+            ck: Vec::new(),
             users: Vec::new(),
             starts: Vec::new(),
             segs: Vec::new(),
@@ -677,19 +743,20 @@ impl Acc {
 
 /// The click credited with a session starting at `s` (rules.md clicks step
 /// 4): among clicks with `s - 7d <= ts <= s`, the latest ts, then the
-/// smallest click_id. `cls` is sorted by (ts, click_id).
+/// smallest click_id. `cls` is packed and in (ts, click_id) order; `s` is
+/// relative to the click base.
 #[inline]
-fn credit(cls: &[ClickRow], s: i64, organic: u32) -> u32 {
-    let ub = cls.partition_point(|c| c.ts <= s);
+fn credit<T: Pack>(cls: &[T], s: u64, organic: u32) -> u32 {
+    let ub = cls.partition_point(|c| c.click_ts() <= s);
     if ub == 0 {
         return organic;
     }
-    let t = cls[ub - 1].ts;
-    if s - t > WEEK {
+    let t = cls[ub - 1].click_ts();
+    if s - t > WEEK as u64 {
         return organic;
     }
-    let lb = cls[..ub].partition_point(|c| c.ts < t);
-    cls[lb].campaign
+    let lb = cls[..ub].partition_point(|c| c.click_ts() < t);
+    cls[lb].click_campaign()
 }
 
 fn top_category(cats: &[(u32, i64)], rank: &[u32]) -> u32 {
@@ -704,9 +771,9 @@ fn top_category(cats: &[(u32, i64)], rank: &[u32]) -> u32 {
     best
 }
 
-/// One person: `evs` sorted by ts, `cls` sorted by (ts, click_id).
-fn process_person(p: u64, evs: &[Surv], cls: &[ClickRow], acc: &mut Acc, cx: &SessCtx) {
-    let Acc { camp, users, starts, segs, cats, tmp } = acc;
+/// One person: `evs` (packed) sorted by ts, `cls` (packed) in (ts, click_id) order.
+fn process_person<T: Pack>(p: u64, evs: &[T], cls: &[T], acc: &mut Acc<T>, cx: &SessCtx) {
+    let Acc { camp, users, starts, segs, cats, tmp, .. } = acc;
     starts.clear();
     segs.clear();
     cats.clear();
@@ -719,9 +786,9 @@ fn process_person(p: u64, evs: &[Surv], cls: &[ClickRow], acc: &mut Acc, cx: &Se
     while i < n {
         // A new session starts when the gap to the previous event is over 30
         // minutes; equal timestamps have gap 0 and always stay together.
-        let start = evs[i].ts;
+        let start = cx.ws + evs[i].ev_ts() as i64;
         let mut j = i + 1;
-        while j < n && evs[j].ts - evs[j - 1].ts <= GAP {
+        while j < n && evs[j].ev_ts() - evs[j - 1].ev_ts() <= GAP as u64 {
             j += 1;
         }
         let day = start.div_euclid(DAY);
@@ -746,13 +813,15 @@ fn process_person(p: u64, evs: &[Surv], cls: &[ClickRow], acc: &mut Acc, cx: &Se
         let mut rev = 0i64;
         let mut purchased = false;
         for e in &evs[i..j] {
-            if (e.price_kind >> 24) as u8 == KIND_PURCHASE {
-                let price = (e.price_kind & 0x00FF_FFFF) as i64;
+            // A valid purchase has price >= 1; views and carts carry 0.
+            let price = e.ev_price() as i64;
+            if price != 0 {
                 rev += price;
                 purchased = true;
-                match cats.iter_mut().find(|(c, _)| *c == e.cat) {
+                let cat = e.ev_cat();
+                match cats.iter_mut().find(|(c, _)| *c == cat) {
                     Some(x) => x.1 += price,
-                    None => cats.push((e.cat, price)),
+                    None => cats.push((cat, price)),
                 }
             }
         }
@@ -760,7 +829,7 @@ fn process_person(p: u64, evs: &[Surv], cls: &[ClickRow], acc: &mut Acc, cx: &Se
         d_events += (j - i) as u32;
         d_revenue += rev;
 
-        let c = credit(cls, start, cx.organic);
+        let c = credit(cls, (start - cx.cbase) as u64, cx.organic);
         let slot = &mut camp[c as usize * ndays + (day - cx.day0) as usize];
         slot[0] += 1;
         slot[1] += purchased as i64;
@@ -789,7 +858,7 @@ fn process_person(p: u64, evs: &[Surv], cls: &[ClickRow], acc: &mut Acc, cx: &Se
         return;
     }
     tmp.clear();
-    tmp.extend(cls.iter().map(|c| (c.campaign, c.ts)));
+    tmp.extend(cls.iter().map(|c| (c.click_campaign(), cx.cbase + c.click_ts() as i64)));
     tmp.sort_unstable();
     let nsess = starts.len();
     let mut add_range = |c: u32, a: i64, b: i64| {
@@ -873,9 +942,9 @@ impl UserWriter {
 /// most of user_daily is written while other threads are still sessionizing.
 const USER_FLUSH: usize = 1 << 18;
 
-fn write_outputs(
+fn write_outputs<T>(
     out_dir: &Path,
-    accs: &[Acc],
+    accs: &[Acc<T>],
     exotic: &intern::Interner,
     lookups: &Lookups,
     cx: &SessCtx,
