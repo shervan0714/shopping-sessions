@@ -44,8 +44,22 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const GAP: i64 = 30 * MINUTE;
 const WEEK: i64 = 7 * DAY;
-/// Chunk size: small enough that a worker's read buffer stays in its L2.
+/// Chunk size for the default input mode (`pread` into a reused buffer):
+/// small enough that a worker's read buffer stays in its L2.
 const CHUNK: usize = 512 << 10;
+/// Chunk size when parsing straight from the mapping (`SS_INPUT=populate`).
+const POPULATE_CHUNK: usize = 4 << 20;
+
+/// How event and click chunks reach the parser.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InputMode {
+    /// `pread` each chunk into a small reused buffer (cache-hot for the
+    /// parser), with a background readahead thread hinting ahead.
+    Pread,
+    /// `MADV_POPULATE_READ` each 4 MB chunk (one call maps all its pages from
+    /// the page cache, no per-page faults), then parse from the mapping.
+    Populate,
+}
 const NO_CATEGORY: u32 = u32::MAX;
 
 /// A surviving event, tagged with its person key; `w` is the packed event
@@ -180,12 +194,19 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
         let (d, f) = r?;
         mapped.push((files[i].0, d, f));
     }
+    // SS_INPUT=populate (default) | pread: see InputMode. On a 2-vCPU box
+    // populate was equal (warm, 2 threads; cold) or ~7% faster (warm, 1
+    // thread) than pread + readahead; confirm on scorer-like hardware.
+    let mode = match std::env::var("SS_INPUT").as_deref() {
+        Ok("pread") => InputMode::Pread,
+        _ => InputMode::Populate,
+    };
     let mut tasks: Vec<Task> = Vec::new();
     let mut total_bytes = 0usize;
     for &(k, data, file) in &mapped {
         total_bytes += data.len();
         let mut cs = Vec::new();
-        input::chunks(input::body(data), CHUNK, &mut cs);
+        input::chunks(input::body(data), if mode == InputMode::Populate { POPULATE_CHUNK } else { CHUNK }, &mut cs);
         tasks.extend(cs.into_iter().map(|c| (k, c, file, c.as_ptr() as usize - data.as_ptr() as usize)));
     }
 
@@ -196,7 +217,7 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     let mem_bytes = std::env::var("MEM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(24.0) * 1e9;
     let release_chunks = (total_bytes as f64) * 2.2 > mem_bytes * 0.8;
     let build = if cfg!(target_feature = "avx512f") { "avx512" } else { "avx2" };
-    log(t0, &format!("mapped {} files, {:.1} MB, {} chunks, release chunks: {release_chunks}, build: {build}", files.len(), total_bytes as f64 / 1e6, tasks.len()));
+    log(t0, &format!("mapped {} files, {:.1} MB, {} chunks, input {mode:?}, release chunks: {release_chunks}, build: {build}", files.len(), total_bytes as f64 / 1e6, tasks.len()));
     // Bucket counts from the input size (an event line is ~95 bytes): about
     // 40K rows per dedup bucket and 20K events per person partition, powers
     // of two, so each stage's per-bucket table stays in cache at any scale.
@@ -218,7 +239,14 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     // parsers, but at most RA_AHEAD chunks (~512 MB) ahead, so the inputs'
     // page-cache footprint stays bounded. A hint only; never needed for
     // correctness.
-    let readahead = std::env::var_os("SS_NO_READAHEAD").is_none().then(|| {
+    // Readahead helps the pread mode; populate reads each chunk itself.
+    // SS_READAHEAD=1 / SS_NO_READAHEAD=1 force it on / off.
+    let want_ra = match (std::env::var_os("SS_READAHEAD"), std::env::var_os("SS_NO_READAHEAD")) {
+        (_, Some(_)) => false,
+        (Some(_), None) => true,
+        (None, None) => mode == InputMode::Pread,
+    };
+    let readahead = want_ra.then(|| {
         const RA_AHEAD: usize = 128;
         std::thread::spawn(move || {
             for (i, &(_, chunk, _, _)) in tasks.iter().enumerate() {
@@ -249,7 +277,7 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
         sc.spawn(|| {
             people_cell.set(people::People::build(&link_vecs, &exotic));
         });
-        parse_all(nthreads, tasks, next, &pctx, release_chunks)
+        parse_all(nthreads, tasks, next, &pctx, release_chunks, mode)
     });
     let people = people_cell.wait();
     drop(link_vecs);
@@ -456,6 +484,7 @@ fn parse_all(
     next: &'static AtomicUsize,
     pctx: &parse::Ctx,
     release_chunks: bool,
+    mode: InputMode,
 ) -> Vec<Worker> {
     par::run(nthreads, |_| {
             let mut w = Worker::new();
@@ -467,9 +496,19 @@ fn parse_all(
                 // parsing through the file mapping: one streaming kernel
                 // copy, then the parser reads cache-hot memory (through the
                 // mapping it stalled on every 4 KB page).
-                let data: &[u8] = match read_at(file, off, chunk.len(), &mut buf) {
-                    Some(d) => d,
-                    None => chunk, // fall back to the mapping
+                let data: &[u8] = match mode {
+                    InputMode::Pread => match read_at(file, off, chunk.len(), &mut buf) {
+                        Some(d) => d,
+                        None => chunk, // fall back to the mapping
+                    },
+                    InputMode::Populate => {
+                        if sys::advise(chunk, sys::MADV_POPULATE_READ) {
+                            chunk
+                        } else {
+                            // Kernel without it (< 5.14): read this chunk instead.
+                            read_at(file, off, chunk.len(), &mut buf).unwrap_or(chunk)
+                        }
+                    }
                 };
                 match k {
                     0 => parse::events_chunk(data, pctx, &mut w),
