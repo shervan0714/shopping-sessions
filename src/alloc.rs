@@ -151,7 +151,9 @@ pub struct Parts<T: 'static> {
     pub count: usize,
     open: Vec<*mut T>,
     len: Vec<u32>,
-    full: Vec<Vec<&'static [T]>>,
+    /// Full blocks (as raw pointers: rows may still be written through
+    /// pointers from `push_ptr` until `finish`).
+    full: Vec<Vec<*mut T>>,
     arena: Blocks<T>,
 }
 
@@ -169,6 +171,11 @@ impl<T: Copy + 'static> Parts<T> {
     }
     #[inline(always)]
     pub fn push(&mut self, p: usize, x: T) {
+        self.push_ptr(p, x);
+    }
+    /// `push`, returning where the row went (blocks never move).
+    #[inline(always)]
+    pub fn push_ptr(&mut self, p: usize, x: T) -> *mut T {
         let block = self.arena.block;
         // SAFETY: p < n (bounds-checked on `open`); a block is replaced as
         // soon as it fills, so the write is in bounds.
@@ -178,26 +185,32 @@ impl<T: Copy + 'static> Parts<T> {
             if o.is_null() {
                 *o = self.arena.take();
             }
-            o.add(*n as usize).write(x);
+            let at = o.add(*n as usize);
+            at.write(x);
             *n += 1;
             self.count += 1;
             if *n as usize == block {
-                self.full[p].push(std::slice::from_raw_parts(*o, block));
+                self.full[p].push(*o);
                 *o = std::ptr::null_mut();
                 *n = 0;
             }
+            at
         }
     }
     /// The blocks of each partition.
     pub fn finish(self) -> Vec<Vec<&'static [T]>> {
-        let mut full = self.full;
-        for p in 0..full.len() {
+        let block = self.arena.block;
+        let mut out: Vec<Vec<&'static [T]>> = Vec::with_capacity(self.full.len());
+        for (p, f) in self.full.into_iter().enumerate() {
+            // SAFETY: full blocks hold `block` written rows; the first len
+            // rows of the open block are written. Blocks are never freed.
+            let mut v: Vec<&'static [T]> = f.into_iter().map(|b| unsafe { std::slice::from_raw_parts(b as *const T, block) }).collect();
             if self.len[p] > 0 {
-                // SAFETY: the first len rows of the open block are written.
-                full[p].push(unsafe { std::slice::from_raw_parts(self.open[p], self.len[p] as usize) });
+                v.push(unsafe { std::slice::from_raw_parts(self.open[p], self.len[p] as usize) });
             }
+            out.push(v);
         }
-        full
+        out
     }
 }
 

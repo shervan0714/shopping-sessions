@@ -5,7 +5,8 @@ use crate::scan::scan;
 use crate::input::Lookups;
 use crate::idkey::{key, mix};
 use crate::alloc::{Blocks, Parts, POOL_BLOCK};
-use crate::people::{pp, ppart, PeopleSlot};
+use crate::pack::Pack;
+use crate::people::{pp, ppart, LinkFilter, PeopleSlot};
 use crate::intern::{IdLog, Interner};
 use crate::ts::{self, DAY};
 
@@ -14,14 +15,21 @@ pub const KIND_VIEW: u8 = 1;
 pub const KIND_CART: u8 = 2;
 pub const KIND_PURCHASE: u8 = 3;
 
-/// Events are hash-partitioned on `event_id` into this many buckets while
-/// they are parsed, so every copy of an event lands in the same bucket and the
-/// buckets can be deduplicated independently. Each worker appends to one
+/// Every copy of an event writes two things while it is parsed:
+///
+/// - a small dedup record (`Cand`: event_id key, ingest_ts, where its
+///   payload is), hash-partitioned on `event_id` into this many buckets, so
+///   every copy of an event lands in the same bucket and the buckets can be
+///   deduplicated independently;
+/// - if the copy is valid, its payload (`Surv`: user key, packed event),
+///   written once: straight into its person partition when the user is in no
+///   link (then the user is the person), or else into this worker's deferred
+///   list, resolved to a person after dedup (main.rs).
+///
+/// Dedup then reads only the records and marks the payloads of the copies it
+/// drops as dead (`DEAD`); nothing is copied. Each worker appends to one
 /// fixed-capacity block per bucket (never reallocated); a full block is moved
-/// to the bucket's list. A block is 2048 rows (80 KB): above the fixed mmap
-/// threshold set in main, so each block is its own mapping and is returned to
-/// the OS the moment dedup has copied it (keeping peak memory near the size
-/// of the parsed rows). Only the tail of each open block is hot in cache.
+/// to the bucket's list. Only the tail of each open block is hot in cache.
 /// The count is sized from the input before parsing (`set_ev_bits`): about
 /// 40K rows per bucket, so one dedup table per bucket stays cache-resident.
 static EV_PART_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8);
@@ -34,28 +42,37 @@ pub fn ev_parts() -> usize {
 }
 pub const BLOCK: usize = 2048;
 
-/// One parsed (well-formed, non-empty `event_id`) event line. Every copy of
-/// an event takes part in dedup, valid or not; `kind == KIND_INVALID` marks a
-/// copy that fails validation (rules.md events steps 3-4: invalid or late),
-/// which is dropped only if dedup keeps it. The late check depends only on the
-/// copy's own ts and ingest_ts, so it is decided here. IDs are exact 64-bit
-/// keys (`idkey`). `price_kind` = price (24 bits, max 10,000,000 < 2^24) |
-/// kind << 24; `cat` is only set for purchases (only they feed top_category).
+/// The dedup record of one parsed (well-formed, non-empty `event_id`) event
+/// line. Every copy of an event takes part in dedup, valid or not; a copy that
+/// fails validation (rules.md events steps 3-4: invalid or late) has no
+/// payload (`pay` null), so it is dropped if dedup keeps it. The late check
+/// depends only on the copy's own ts and ingest_ts, so it is decided here.
+/// `eid` is an exact 64-bit key (`idkey`).
 #[derive(Clone, Copy)]
-pub struct EvRow {
+pub struct Cand {
     pub eid: u64,
-    pub ingest: i64,     // ingest_ts
-    pub ts: i64,         // ts (only meaningful when valid)
-    pub user: u64,       // user key (only when valid)
-    pub price_kind: u32,
-    pub cat: u32,
+    /// ingest_ts (i64::MAX if unparsable: such a copy loses every tie).
+    pub ingest: i64,
+    /// The `person` field of this copy's payload, or null if invalid.
+    pub pay: *mut u64,
 }
 
-impl EvRow {
-    #[inline(always)]
-    pub fn kind(&self) -> u8 {
-        (self.price_kind >> 24) as u8
-    }
+// SAFETY: `pay` is written only by the dedup of the record's own bucket
+// (one thread), and read by no one before dedup has finished.
+unsafe impl Send for Cand {}
+unsafe impl Sync for Cand {}
+
+/// The `person` of a payload whose copy dedup dropped. Never a key: packed
+/// keys use 60 bits, exotic ones at most 63.
+pub const DEAD: u64 = u64::MAX;
+
+/// A valid event copy's payload: its person (or, in a deferred list, its
+/// user) key and the packed event (pack.rs: ts offset, price, category).
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct Surv<T> {
+    pub person: u64,
+    pub w: T,
 }
 
 /// A valid click (rules.md clicks step 3). Clicks are not deduplicated: copies
@@ -73,6 +90,9 @@ pub struct ClickRow {
 pub struct Ctx<'a> {
     pub lookups: &'a Lookups,
     pub exotic: &'a Interner,
+    /// Every ID that appears in a link (a superset filter): an event whose
+    /// user misses it is its own person.
+    pub linked: &'a LinkFilter,
     /// Set by the people thread; clicks (parsed after links and events)
     /// are resolved to their person right away.
     pub people: &'a PeopleSlot,
@@ -80,14 +100,18 @@ pub struct Ctx<'a> {
     pub we: i64,
 }
 
-pub struct Worker {
+pub struct Worker<T: Pack> {
     /// Open block (and its fill) per event bucket; blocks come from a
     /// per-worker huge-page arena.
-    open: Vec<*mut EvRow>,
+    open: Vec<*mut Cand>,
     open_len: Vec<u32>,
     /// Full blocks per event bucket.
-    full: Vec<Vec<&'static [EvRow]>>,
-    arena: Blocks<EvRow>,
+    full: Vec<Vec<&'static [Cand]>>,
+    arena: Blocks<Cand>,
+    /// Payloads of valid copies whose user is in no link, by person partition.
+    pub surv: Parts<Surv<T>>,
+    /// Payloads of valid copies whose user may be linked (one list).
+    pub deferred: Parts<Surv<T>>,
     /// 64 - log2(bucket count): the bucket is the top bits of mix(eid).
     shift: u32,
     pub n_events: usize,
@@ -99,9 +123,9 @@ pub struct Worker {
 }
 
 // SAFETY: the raw block pointers are owned by this worker alone.
-unsafe impl Send for Worker {}
+unsafe impl<T: Pack> Send for Worker<T> {}
 
-impl Worker {
+impl<T: Pack> Worker<T> {
     pub fn new() -> Self {
         let mut arena = Blocks::new(BLOCK);
         let n = ev_parts();
@@ -110,6 +134,8 @@ impl Worker {
             open_len: vec![0; n],
             full: (0..n).map(|_| Vec::new()).collect(),
             arena,
+            surv: Parts::new(pp(), POOL_BLOCK / std::mem::size_of::<Surv<T>>()),
+            deferred: Parts::new(1, POOL_BLOCK / std::mem::size_of::<Surv<T>>()),
             shift: 64 - n.trailing_zeros(),
             n_events: 0,
             clicks: Parts::new(pp(), POOL_BLOCK / std::mem::size_of::<ClickRow>()),
@@ -119,7 +145,7 @@ impl Worker {
     }
 
     #[inline(always)]
-    fn push_event(&mut self, row: EvRow) {
+    fn push_event(&mut self, row: Cand) {
         let p = if self.shift == 64 { 0 } else { (mix(row.eid) >> self.shift) as usize };
         // SAFETY: p < the bucket count; the open block has room (it is replaced as
         // soon as it fills).
@@ -137,8 +163,13 @@ impl Worker {
         self.n_events += 1;
     }
 
-    /// Every block of each bucket (full ones and the open one).
-    pub fn into_parts(self) -> (Vec<Vec<&'static [EvRow]>>, Vec<Vec<&'static [ClickRow]>>, IdLog) {
+    /// Every dedup-record block of each bucket (full ones and the open one),
+    /// the click blocks, the payloads (still open: dedup writes `DEAD` into
+    /// them through `Cand::pay`) and the ID log.
+    #[allow(clippy::type_complexity)]
+    pub fn into_parts(
+        self,
+    ) -> (Vec<Vec<&'static [Cand]>>, Vec<Vec<&'static [ClickRow]>>, Parts<Surv<T>>, Parts<Surv<T>>, IdLog) {
         let mut full = self.full;
         for p in 0..self.open.len() {
             if self.open_len[p] > 0 {
@@ -146,7 +177,7 @@ impl Worker {
                 full[p].push(unsafe { std::slice::from_raw_parts(self.open[p], self.open_len[p] as usize) });
             }
         }
-        (full, self.clicks.finish(), self.ids)
+        (full, self.clicks.finish(), self.surv, self.deferred, self.ids)
     }
 }
 
@@ -168,7 +199,29 @@ fn price(b: &[u8]) -> Option<u32> {
     (1..=10_000_000).contains(&v).then_some(v)
 }
 
-pub fn events_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
+pub fn events_chunk<T: Pack>(chunk: &[u8], ctx: &Ctx, w: &mut Worker<T>) {
+    // Once the people table is built (on its own thread, usually early in
+    // parsing), a valid copy whose user may be linked is resolved to its
+    // person right here, in batches with the lookups prefetched (like
+    // clicks); before that, it goes to the deferred list.
+    let people = ctx.people.get();
+    const BATCH: usize = 64;
+    let mut batch = [(Cand { eid: 0, ingest: 0, pay: std::ptr::null_mut() }, Surv { person: 0, w: T::default() }); BATCH];
+    let mut nb = 0usize;
+    let flush = |batch: &[(Cand, Surv<T>)], w: &mut Worker<T>| {
+        let Some(people) = people else { return };
+        for x in batch {
+            people.prefetch_filter(x.1.person);
+        }
+        for x in batch {
+            people.prefetch_slot(x.1.person);
+        }
+        for &(mut c, s) in batch {
+            let person = people.person(s.person);
+            c.pay = w.surv.push_ptr(ppart(person), Surv { person, w: s.w }) as *mut u64;
+            w.push_event(c);
+        }
+    };
     scan::<7>(chunk, |f| {
         let &[eid, user, tsf, ingf, typ, product, pricef] = f;
         if eid.is_empty() {
@@ -178,14 +231,7 @@ pub fn events_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
         // ingest_ts is always valid F1 per the rules; if it ever is not, the
         // copy sorts last in dedup and is invalid if kept.
         let ingest = ts::parse(ingf);
-        let mut row = EvRow {
-            eid: ek,
-            ingest: ingest.unwrap_or(i64::MAX),
-            ts: 0,
-            user: 0,
-            price_kind: 0,
-            cat: 0,
-        };
+        let mut row = Cand { eid: ek, ingest: ingest.unwrap_or(i64::MAX), pay: std::ptr::null_mut() };
         if let Some(ing) = ingest {
             if !user.is_empty() && !product.is_empty() {
                 let kind = match typ {
@@ -199,12 +245,27 @@ pub fn events_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
                     if let (Some(t), Some(p)) = (ts::parse(tsf), p) {
                         // In the event window, and not late (ingest - ts over 24 h).
                         if t >= ctx.ws && t < ctx.we && ing - t <= DAY {
-                            if kind == KIND_PURCHASE {
-                                row.cat = ctx.lookups.products.get(product).unwrap_or(ctx.lookups.unknown_category) as u32;
+                            let cat = if kind == KIND_PURCHASE {
+                                ctx.lookups.products.get(product).unwrap_or(ctx.lookups.unknown_category) as u32
+                            } else {
+                                0
+                            };
+                            let u = key::<true>(user, ctx.exotic, &mut w.ids);
+                            let s = Surv { person: u, w: T::ev((t - ctx.ws) as u64, p, cat) };
+                            if !ctx.linked.maybe(u) {
+                                // In no link: the user is the person.
+                                row.pay = w.surv.push_ptr(ppart(u), s) as *mut u64;
+                            } else if people.is_some() {
+                                batch[nb] = (row, s);
+                                nb += 1;
+                                if nb == BATCH {
+                                    flush(&batch, w);
+                                    nb = 0;
+                                }
+                                return;
+                            } else {
+                                row.pay = w.deferred.push_ptr(0, s) as *mut u64;
                             }
-                            row.ts = t;
-                            row.price_kind = p | (kind as u32) << 24;
-                            row.user = key::<true>(user, ctx.exotic, &mut w.ids);
                         }
                     }
                 }
@@ -212,9 +273,10 @@ pub fn events_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
         }
         w.push_event(row);
     });
+    flush(&batch[..nb], w);
 }
 
-pub fn clicks_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
+pub fn clicks_chunk<T: Pack>(chunk: &[u8], ctx: &Ctx, w: &mut Worker<T>) {
     let lo = ctx.ws - 7 * DAY;
     let people = ctx.people.wait();
     // Person lookups are random reads: resolve clicks in batches, with the
@@ -222,7 +284,7 @@ pub fn clicks_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
     const BATCH: usize = 64;
     let mut buf = [ClickRow { ts: 0, cid: 0, user: 0, campaign: 0 }; BATCH];
     let mut nb = 0usize;
-    let flush = |buf: &[ClickRow], w: &mut Worker| {
+    let flush = |buf: &[ClickRow], w: &mut Worker<T>| {
         for c in buf {
             people.prefetch_filter(c.user);
         }

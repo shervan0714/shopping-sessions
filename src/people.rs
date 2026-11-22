@@ -29,6 +29,58 @@ pub fn ppart(k: u64) -> usize {
     (mix(k) >> (64 - PP_BITS.load(std::sync::atomic::Ordering::Relaxed))) as usize
 } // never a key: packed keys use 60 bits, exotic ones 63+32
 
+/// Every ID that appears in a link, as a bit filter (no false negatives),
+/// built right after the links are parsed and before events are: an event
+/// whose user misses it is its own person, so its payload goes straight to
+/// its person partition without waiting for (or looking up) the people
+/// table. About 16 bits per link endpoint, so it stays cache-resident.
+pub struct LinkFilter {
+    shift: u32,
+    words: Vec<u64>,
+}
+
+impl LinkFilter {
+    /// A filter nothing is in (no links).
+    pub fn empty() -> Self {
+        LinkFilter { shift: 64, words: Vec::new() }
+    }
+
+    pub fn build(links: &[Vec<(u64, u64)>]) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let n: usize = links.iter().map(Vec::len).sum();
+        if n == 0 {
+            return Self::empty();
+        }
+        let bits = (32 * n).next_power_of_two().max(1 << 16).trailing_zeros();
+        let words: Vec<AtomicU64> = (0..(1usize << bits) / 64).map(|_| AtomicU64::new(0)).collect();
+        let shift = 64 - bits;
+        crate::par::each(links.len(), |_| (), |_, i| {
+            for &(a, b) in &links[i] {
+                for k in [a, b] {
+                    let f = (mix(k) >> shift) as usize;
+                    words[f / 64].fetch_or(1 << (f % 64), Relaxed);
+                }
+            }
+        });
+        LinkFilter { shift, words: words.into_iter().map(AtomicU64::into_inner).collect() }
+    }
+
+    /// Whether `k` may appear in a link (false: it certainly does not).
+    #[inline(always)]
+    pub fn maybe(&self, k: u64) -> bool {
+        if self.shift == 64 {
+            return false;
+        }
+        let f = (mix(k) >> self.shift) as usize;
+        // SAFETY: f < 2^(64 - shift) = words.len() * 64.
+        unsafe { *self.words.get_unchecked(f / 64) & (1 << (f % 64)) != 0 }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.words.len() * 8
+    }
+}
+
 /// The people table, published once by the thread that builds it; readers
 /// block (no spinning) until it is there.
 #[derive(Default)]
@@ -43,6 +95,10 @@ impl PeopleSlot {
         let _ = self.table.set(p);
         *self.ready.lock().unwrap() = true;
         self.cv.notify_all();
+    }
+    /// The table if it is built already (never blocks).
+    pub fn get(&self) -> Option<&People> {
+        self.table.get()
     }
     /// Wait until `set` has run.
     pub fn wait(&self) -> &People {

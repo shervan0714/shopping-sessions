@@ -30,7 +30,7 @@ mod sys;
 mod ts;
 
 use input::Lookups;
-use parse::{ClickRow, EvRow, Worker};
+use parse::{Cand, ClickRow, Surv, Worker, DEAD};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
@@ -61,14 +61,6 @@ enum InputMode {
     Populate,
 }
 const NO_CATEGORY: u32 = u32::MAX;
-
-/// A surviving event, tagged with its person key; `w` is the packed event
-/// (pack.rs).
-#[derive(Clone, Copy)]
-struct Surv<T> {
-    person: u64,
-    w: T,
-}
 
 use pack::Pack;
 
@@ -131,6 +123,17 @@ fn main() {
 fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     let (ws, we) = input::load_manifest(data_dir)?;
     let lookups = input::load_lookups(data_dir)?;
+    // Events are packed into `T` words while they are parsed (pack.rs).
+    // SS_WIDE=1 forces the general u128 layout (to test it).
+    if pack::narrow_fits(ws, we, lookups.categories.len(), WEEK) && std::env::var_os("SS_WIDE").is_none() {
+        run_with::<u64>(data_dir, out_dir, t0, ws, we, lookups)
+    } else {
+        log(t0, "wide window or many categories: u128 rows");
+        run_with::<u128>(data_dir, out_dir, t0, ws, we, lookups)
+    }
+}
+
+fn run_with<T: Pack>(data_dir: &Path, out_dir: &Path, t0: Instant, ws: i64, we: i64, lookups: Lookups) -> Result<(), Error> {
 
     // ---- 1. map and chunk -------------------------------------------------
     let mut files: Vec<(u8, PathBuf)> = Vec::new();
@@ -223,7 +226,8 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     // ---- 2. parse ---------------------------------------------------------
     let exotic = intern::Interner::new();
     let people_cell = people::PeopleSlot::default();
-    let pctx = parse::Ctx { lookups: &lookups, exotic: &exotic, people: &people_cell, ws, we };
+    let no_links = people::LinkFilter::empty();
+    let pctx = parse::Ctx { lookups: &lookups, exotic: &exotic, linked: &no_links, people: &people_cell, ws, we };
     let nthreads = par::threads();
     // Links first (small), so the people table can be built on its own
     // thread while the events and clicks are parsed.
@@ -239,26 +243,33 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     // exotic IDs and publish their names first (small: links only).
     exotic.verify_links(&mut link_logs.iter_mut().collect::<Vec<_>>())?;
     let n_links: usize = link_vecs.iter().map(Vec::len).sum();
-    let workers = std::thread::scope(|sc| {
+    // Which users may be linked: the others' events need no person lookup.
+    let linked = people::LinkFilter::build(&link_vecs);
+    let ectx = parse::Ctx { linked: &linked, ..pctx };
+    let workers: Vec<Worker<T>> = std::thread::scope(|sc| {
         sc.spawn(|| {
             people_cell.set(people::People::build(&link_vecs, &exotic));
         });
-        parse_all(nthreads, tasks, next, &pctx, release_chunks, mode)
+        parse_all(nthreads, tasks, next, &ectx, release_chunks, mode)
     });
     let people = people_cell.wait();
     drop(link_vecs);
     let n_ev_rows: usize = workers.iter().map(|w| w.n_events).sum();
     let n_clicks: usize = workers.iter().map(|w| w.n_clicks).sum();
     log(t0, &format!("parsed: {n_ev_rows} event rows, {n_clicks} valid clicks, {n_links} links"));
-    log(t0, &format!("people: {} linked ids, {} merged into another person", people.n_ids, people.n_merged));
+    log(t0, &format!("people: {} linked ids, {} merged into another person; link filter {} KB", people.n_ids, people.n_merged, linked.bytes() >> 10));
 
     // ---- 3. regroup worker output ---------------------------------------------
     let (ev_parts_n, pp) = (parse::ev_parts(), people::pp());
-    let mut buckets: Vec<Vec<&'static [EvRow]>> = (0..ev_parts_n).map(|_| Vec::new()).collect();
+    let mut buckets: Vec<Vec<&'static [Cand]>> = (0..ev_parts_n).map(|_| Vec::new()).collect();
     let mut cl_parts: Vec<Vec<&'static [ClickRow]>> = (0..pp).map(|_| Vec::new()).collect();
     let mut logs = link_logs;
+    let mut surv = Vec::new();
+    let mut deferred = Vec::new();
     for w in workers {
-        let (blocks, clicks, ids) = w.into_parts();
+        let (blocks, clicks, s, d, ids) = w.into_parts();
+        surv.push(s);
+        deferred.push(d);
         for (p, b) in blocks.into_iter().enumerate() {
             buckets[p].extend(b);
         }
@@ -294,19 +305,17 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     }
 
     // ---- 4.. dedup, sessions and output on packed rows (pack.rs) -----------
-    let st = Stage { buckets, cl_parts, people, exotic: &exotic, lookups: &lookups, ws, we, out_dir, t0 };
-    // SS_WIDE=1 forces the general u128 layout (to test it).
-    if pack::narrow_fits(ws, we, lookups.categories.len(), WEEK) && std::env::var_os("SS_WIDE").is_none() {
-        finish::<u64>(st)
-    } else {
-        log(t0, "wide window or many categories: u128 rows");
-        finish::<u128>(st)
-    }
+    let st = Stage { buckets, surv, deferred, cl_parts, people, exotic: &exotic, lookups: &lookups, ws, we, out_dir, t0 };
+    finish::<T>(st)
 }
 
 /// Everything the stages after parsing need.
-struct Stage<'a> {
-    buckets: Vec<Vec<&'static [EvRow]>>,
+struct Stage<'a, T: Pack> {
+    buckets: Vec<Vec<&'static [Cand]>>,
+    /// Payloads by person partition (users in no link), per worker.
+    surv: Vec<alloc::Parts<Surv<T>>>,
+    /// Payloads of possibly linked users, per worker (one list each).
+    deferred: Vec<alloc::Parts<Surv<T>>>,
     cl_parts: Vec<Vec<&'static [ClickRow]>>,
     people: &'a people::People,
     exotic: &'a intern::Interner,
@@ -319,25 +328,37 @@ struct Stage<'a> {
 
 /// Dedup, sessions, attribution, aggregation and output, with events and
 /// clicks packed as `T` words.
-fn finish<T: Pack>(st: Stage) -> Result<(), Error> {
-    let Stage { buckets, cl_parts, people, exotic, lookups, ws, we, out_dir, t0 } = st;
+fn finish<T: Pack>(st: Stage<T>) -> Result<(), Error> {
+    let Stage { buckets, surv, deferred, cl_parts, people, exotic, lookups, ws, we, out_dir, t0 } = st;
     let pp = people::pp();
     // ---- 4. dedup events -----------------------------------------------------
-    // Survivors go straight into per-thread block chains, one per person
-    // partition (no intermediate array, no second scatter pass).
-    let writers = par::each(
-        buckets.len(),
-        |_| (alloc::Parts::<Surv<T>>::new(pp, alloc::POOL_BLOCK / std::mem::size_of::<Surv<T>>()), 0usize),
-        |(out, n), p| *n += dedup(&buckets[p], people, ws, out),
-    );
-    let n_surv: usize = writers.iter().map(|w| w.1).sum();
+    // Only the dedup records are read; dropped copies' payloads are marked
+    // DEAD in place (they were written once, while parsing).
+    let n_surv: usize = par::each(buckets.len(), |_| 0usize, |n, p| *n += dedup(&buckets[p])).into_iter().sum();
+    // Payloads of users in no link are already in their person partitions.
     let mut ev_parts: Vec<Vec<&'static [Surv<T>]>> = (0..pp).map(|_| Vec::new()).collect();
-    for (w, _) in writers {
+    let n_direct: usize = surv.iter().map(|s| s.count).sum();
+    for s in surv {
+        for (p, b) in s.finish().into_iter().enumerate() {
+            ev_parts[p].extend(b);
+        }
+    }
+    // The others' users may be linked: resolve each live one to its person
+    // and move it to that person's partition.
+    let dblocks: Vec<&'static [Surv<T>]> = deferred.into_iter().flat_map(|d| d.finish().into_iter().flatten()).collect();
+    let n_deferred: usize = dblocks.iter().map(|b| b.len()).sum();
+    let writers = par::each(
+        dblocks.len(),
+        |_| alloc::Parts::<Surv<T>>::new(pp, alloc::POOL_BLOCK / std::mem::size_of::<Surv<T>>()),
+        |out, i| resolve(dblocks[i], people, out),
+    );
+    for w in writers {
         for (p, b) in w.finish().into_iter().enumerate() {
             ev_parts[p].extend(b);
         }
     }
-    log(t0, &format!("dedup: {n_surv} surviving events"));
+    log(t0, &format!("dedup: {n_surv} surviving events ({n_direct} payloads placed while parsing, {n_deferred} resolved to a person after dedup)"));
+    let _ = ws;
 
     // ---- 5. sessions, attribution, aggregation ------------------------------
     let day0 = ws.div_euclid(DAY);
@@ -454,16 +475,16 @@ fn read_at<'b>(file: &std::fs::File, off: usize, len: usize, buf: &'b mut Vec<u8
 }
 
 /// Parse every remaining (event and click) chunk on `nthreads` workers.
-fn parse_all(
+fn parse_all<T: Pack>(
     nthreads: usize,
     tasks: &'static [Task],
     next: &'static AtomicUsize,
     pctx: &parse::Ctx,
     release_chunks: bool,
     mode: InputMode,
-) -> Vec<Worker> {
+) -> Vec<Worker<T>> {
     par::run(nthreads, |_| {
-            let mut w = Worker::new();
+            let mut w = Worker::<T>::new();
             let mut buf: Vec<u8> = Vec::new();
             loop {
                 let i = next.fetch_add(1, Relaxed);
@@ -557,6 +578,9 @@ fn group_partition<T: Pack>(blocks: &[&'static [Surv<T>]], cls: &[&'static [Clic
     for b in blocks {
         for e in b.iter() {
             let k = e.person;
+            if k == DEAD {
+                continue;
+            }
             let mut h = idkey::mix(k) as usize & mask;
             let pi = loop {
                 let slot = &mut g.table[h];
@@ -577,6 +601,7 @@ fn group_partition<T: Pack>(blocks: &[&'static [Surv<T>]], cls: &[&'static [Clic
         }
     }
     let np = g.persons.len();
+    let n = g.pidx.len(); // live rows
     // Counts -> exclusive offsets (+ end), then scatter.
     let mut acc = 0u32;
     for c in g.ev_off.iter_mut() {
@@ -593,6 +618,9 @@ fn group_partition<T: Pack>(blocks: &[&'static [Surv<T>]], cls: &[&'static [Clic
         let mut i = 0;
         for b in blocks {
             for e in b.iter() {
+                if e.person == DEAD {
+                    continue;
+                }
                 let pi = g.pidx[i] as usize;
                 // SAFETY: every slot in 0..n is written exactly once.
                 unsafe { out.add(pos[pi] as usize).write(e.w) };
@@ -642,8 +670,6 @@ fn group_partition<T: Pack>(blocks: &[&'static [Surv<T>]], cls: &[&'static [Clic
 #[derive(Default)]
 struct DedupScratch {
     table: Vec<(u64, u32)>,
-    win: Vec<u64>,
-    keep: Vec<u32>,
 }
 
 thread_local! {
@@ -651,19 +677,26 @@ thread_local! {
 }
 
 /// Dedup one hash bucket (rules.md events steps 2-4): for each event_id,
-/// keep the copy with the smallest ingest_ts; drop it if invalid or late.
-/// Buckets are sized (~40K rows) so one open-addressing table (event_id key
-/// -> row) per bucket stays cache-resident. Rows stay in their blocks (row
-/// index = block << 11 | offset).
-fn dedup<T: Pack>(blocks: &[&'static [EvRow]], people: &people::People, ws: i64, out: &mut alloc::Parts<Surv<T>>) -> usize {
+/// keep the copy with the smallest ingest_ts; drop it if invalid or late
+/// (no payload). Every other copy's payload is marked DEAD. Buckets are
+/// sized (~40K records) so one open-addressing table (event_id key ->
+/// record) per bucket stays cache-resident. Records stay in their blocks
+/// (index = block << 11 | offset). Returns the number of kept valid copies.
+fn dedup(blocks: &[&'static [Cand]]) -> usize {
     const EMPTY: u64 = u64::MAX;
     const _: () = assert!(parse::BLOCK == 1 << 11);
-    let row = |i: u32| -> &EvRow { &blocks[(i >> 11) as usize][(i & 2047) as usize] };
+    let row = |i: u32| -> &Cand { &blocks[(i >> 11) as usize][(i & 2047) as usize] };
+    // SAFETY: a payload belongs to exactly one record, and each record is in
+    // one bucket, so no two threads write the same payload; nothing reads
+    // payloads until dedup has finished.
+    let kill = |c: &Cand| {
+        if !c.pay.is_null() {
+            unsafe { c.pay.write(DEAD) };
+        }
+    };
     DEDUP.with(|cell| {
         let sc = &mut *cell.borrow_mut();
         let total: usize = blocks.iter().map(|b| b.len()).sum();
-        // One bit per row index (all zero between calls).
-        sc.win.resize(blocks.len() * parse::BLOCK / 64, 0);
         let cap = (total + total / 2).next_power_of_two().max(16);
         let mask = cap - 1;
         sc.table.clear();
@@ -680,10 +713,15 @@ fn dedup<T: Pack>(blocks: &[&'static [EvRow]], people: &people::People, ws: i64,
                         break;
                     }
                     if slot.0 == k {
-                        // Keep the smaller ingest_ts (copies with equal
-                        // ingest_ts are identical, so either is right).
-                        if r.ingest < row(slot.1).ingest {
+                        // Keep the smaller ingest_ts; on a tie the copy seen
+                        // first (copies with equal ingest_ts are identical,
+                        // so either is right).
+                        let best = row(slot.1);
+                        if r.ingest < best.ingest {
+                            kill(best);
                             slot.1 = me;
+                        } else {
+                            kill(r);
                         }
                         break;
                     }
@@ -691,56 +729,42 @@ fn dedup<T: Pack>(blocks: &[&'static [EvRow]], people: &people::People, ws: i64,
                 }
             }
         }
-        // Mark the kept copies; rows are then read in block order.
-        for &(k, i) in table.iter() {
-            if k != EMPTY {
-                sc.win[(i >> 6) as usize] |= 1 << (i & 63);
-            }
-        }
-        let mut kept = 0usize;
-        // Emit the kept valid copies (invalid and late ones were marked
-        // KIND_INVALID while parsing). Person lookups are random reads, so
-        // they are prefetched a few rows ahead.
-        const AHEAD: usize = 16;
-        sc.keep.clear();
-        for (wi, w) in sc.win.iter_mut().enumerate() {
-            let mut bits = std::mem::take(w);
-            while bits != 0 {
-                let i = (wi as u32) << 6 | bits.trailing_zeros();
-                bits &= bits - 1;
-                let r = row(i);
-                if r.kind() != parse::KIND_INVALID {
-                    sc.keep.push(i);
-                }
-            }
-        }
-        let n = sc.keep.len();
-        for a in 0..n.min(2 * AHEAD) {
-            people.prefetch_filter(row(sc.keep[a]).user);
-        }
-        for a in 0..n.min(AHEAD) {
-            people.prefetch_slot(row(sc.keep[a]).user);
-        }
-        for a in 0..n {
-            if a + 2 * AHEAD < n {
-                people.prefetch_filter(row(sc.keep[a + 2 * AHEAD]).user);
-            }
-            if a + AHEAD < n {
-                people.prefetch_slot(row(sc.keep[a + AHEAD]).user);
-            }
-            let r = row(sc.keep[a]);
-            let person = people.person(r.user);
-            let w = T::ev((r.ts - ws) as u64, r.price_kind & 0x00FF_FFFF, r.cat);
-            out.push(ppart(person), Surv { person, w });
-        }
-        kept += n;
-        // This bucket's event blocks are dead now: recycle them for the
-        // survivor blocks other buckets are about to fill.
+        let kept = table.iter().filter(|&&(k, i)| k != EMPTY && !row(i).pay.is_null()).count();
+        // This bucket's record blocks are dead now: recycle them.
         for b in blocks {
             alloc::pool_put(b.as_ptr() as *const u8);
         }
         kept
     })
+}
+
+/// Move one block of deferred payloads (users that may be linked) to their
+/// person's partition, skipping dead ones. Person lookups are random reads,
+/// so they are prefetched a few rows ahead.
+fn resolve<T: Pack>(block: &'static [Surv<T>], people: &people::People, out: &mut alloc::Parts<Surv<T>>) {
+    const AHEAD: usize = 16;
+    let n = block.len();
+    for a in 0..n.min(2 * AHEAD) {
+        people.prefetch_filter(block[a].person);
+    }
+    for a in 0..n.min(AHEAD) {
+        people.prefetch_slot(block[a].person);
+    }
+    for a in 0..n {
+        if a + 2 * AHEAD < n {
+            people.prefetch_filter(block[a + 2 * AHEAD].person);
+        }
+        if a + AHEAD < n {
+            people.prefetch_slot(block[a + AHEAD].person);
+        }
+        let s = block[a];
+        if s.person == DEAD {
+            continue;
+        }
+        let person = people.person(s.person);
+        out.push(ppart(person), Surv { person, w: s.w });
+    }
+    alloc::pool_put(block.as_ptr() as *const u8);
 }
 
 struct SessCtx<'a> {
