@@ -8,7 +8,7 @@ ANSWER ?= dev-answer
 PY ?= python3
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: build fixtures dev run-dev check-dev native native-fixtures native-dev unit cross-check
+.PHONY: build fixtures dev run-dev check-dev native native-fixtures native-dev unit cross-check fuzz pgo
 
 ## Build the image for the scorer's platform
 build:
@@ -46,3 +46,15 @@ native-dev: native
 ## Rust vs the slow Python reference on freshly generated datasets
 cross-check: native
 	PY=$(PY) scripts/cross_check.sh target/release/shopping-sessions 2:150000 3:300000 4:450000 5:150000 9:300000
+
+## Mutation fuzzer: the binary vs scripts/reference.py on hostile data (odd and
+## long IDs, edge timestamps, damaged lines, duplicates, link chains; 200 small
+## rounds + 4 large). Required to pass before any speed change is merged.
+fuzz: native
+	$(PY) scripts/fuzz.py target/release/shopping-sessions
+
+## Regenerate pgo/merged.profdata after a source change (needs
+## `rustup toolchain install 1.85.1 -c llvm-tools-preview`; PGO_DATA = data dirs to train on)
+PGO_DATA ?= $(DEV)
+pgo:
+	scripts/pgo.sh $(PGO_DATA)

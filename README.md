@@ -25,12 +25,20 @@ make native-fixtures                 # cargo build --release + 36 fixtures
 make native-dev check-dev            # dev set + exact diff
 make unit                            # unit tests (timestamps, CSV dialect, SIMD scanner fuzz, keys)
 make cross-check                     # Rust vs scripts/reference.py on freshly generated seeds
+make fuzz                            # mutation fuzzer vs scripts/reference.py (required before any speed change)
+make pgo PGO_DATA="p20 dev"           # regenerate pgo/merged.profdata after a source change (rustc 1.85.1)
 ```
 
 The binary reads `DATA_DIR`/`OUTPUT_DIR` (default `/data`, `/output`) or the
 last two command-line arguments, and `NCPU` for its thread count. It writes
 only `$OUTPUT_DIR/user_daily/*.parquet` and `$OUTPUT_DIR/campaign_daily/*.parquet`;
 diagnostics (stage timings) go to stderr. It needs no scratch space.
+
+The image holds two static, profile-optimised builds: `shopping-sessions`
+(x86-64-v3, AVX2) and `shopping-sessions-avx512` (Cascade Lake). The first
+checks the CPU at startup and runs the second only if every feature it may use
+is present; if that build fails in any way, the first clears its output and
+does the work itself (`SS_NO_AVX512=1` disables the hand-off).
 
 ## Why Rust (and not Polars / DuckDB / Spark)
 
@@ -82,6 +90,16 @@ All of these were run, not assumed:
   It matches `dev-answer` exactly, and the Rust binary matches it on 13 more
   generator seeds (2–12, 15, 16; 150K–2M events; windows from 2025 to 2028,
   including seed 15 whose window contains 2028-02-29).
+* `scripts/fuzz.py`, a mutation fuzzer, writes datasets aimed at the rules'
+  edges (IDs of 11–300 bytes, spaces, ``, tabs, non-ASCII and emoji, case
+  variants; link chains, self-links, shared devices; duplicate events with
+  other ingest times; every bad timestamp form and window edge; 30:00.000 and
+  30:00.001 gaps; 7-day click edges and same-ms click ties; quoted fields,
+  stray quotes, wrong field counts, CRLF, header-only files), runs the binary
+  with a random `NCPU`, and diffs it against `scripts/reference.py`. Seeds 1
+  and 2: 408/408 rounds match, including 8 rounds of 150K–400K events with up
+  to 40 % odd IDs. It caught both deliberately planted bugs tried (a `<` for
+  `<=` in the session gap; a wrong byte order for odd IDs) in its first round.
 * The Docker image, run with the scorer's flags (read-only root, uid 1000,
   no network, 64 MB tmpfs `/tmp`), passes all 36 fixtures and matches the dev
   answer.

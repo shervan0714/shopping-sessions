@@ -57,12 +57,24 @@ than this laptop. That ratio is an estimate, not a measurement.
 | Chunks read with `pread` into a 512 KB per-worker buffer instead of parsed through the mapping (the scanner's input load was 76 % of its time: the hardware prefetcher stops at every 4 KB page) | profile: ~14.6 → ~11 CPU-s per run |
 | SIMD ID packing (16-byte classify + two multiply-adds), fuzzed against the scalar packer; blocking wait (no spin) for the people table | best 1.38 s, ≈10.5 CPU-s (warm, 8 runs: 1.38–1.9 s once WSL memory is warm) |
 
+| **Round 4:** static glibc (`+crt-static`), PGO (rustc 1.85.1, profile from the 20M set, dev and fixtures), plus a Cascade Lake build chosen at startup by CPUID | 15 interleaved runs each: dynamic median 1.90 s, static 1.87 s, static+PGO 1.82 s; minimums 1.57–1.62 s. No difference beyond noise here; kept because neither can change results and both may help on the scorer |
+| Tried, not kept: 512 / 1024 person partitions (`PP_BITS` 9 / 10); `mallopt` (mmap threshold 1 MB, trim 1 GB, top pad 64 MB, 16 arenas) | 10 interleaved runs, median: base 1.82 s, 512 1.81 s, 1024 2.02 s, mallopt 1.84 s |
+
 Profiles were taken with `perf record --call-graph fp`. The biggest wins
 came from removing dependent cache misses (key bytes in the mmapped input),
 not from arithmetic.
 
 ## Limitations and untested cases
 
+* **The Cascade Lake (AVX-512) build has never run correctly here**: this
+  laptop has no AVX-512, so that build dies of an illegal instruction. That
+  failure is what tests the fallback: with `SS_FORCE_AVX512=1` (skip the CPU
+  check) the main build clears the output and produces matching results,
+  natively and in Docker. On the scorer, the AVX-512 build's results are
+  compiler output from the same source, but unverified.
+* Not tried: hand-written AVX-512 code (the scanner and ID packer). AVX-512
+  intrinsics need Rust 1.89+ (the image uses 1.85.1 for the profile), and code
+  that cannot be run here cannot be shown correct.
 * **No measurement on scorer-class hardware or with 24 GB.** The old 60M
   run predates the round-2 rewrite and was not repeated (the laptop has 7.6 GB).
 * Docker image verified on Docker Desktop (Windows) with the scorer's flags
