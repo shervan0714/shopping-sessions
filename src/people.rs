@@ -21,6 +21,35 @@ pub fn ppart(k: u64) -> usize {
     (mix(k) >> (64 - PP_BITS)) as usize
 } // never a key: packed keys use 60 bits, exotic ones 63+32
 
+/// The people table, published once by the thread that builds it; readers
+/// block (no spinning) until it is there.
+#[derive(Default)]
+pub struct PeopleSlot {
+    table: std::sync::OnceLock<People>,
+    ready: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl PeopleSlot {
+    pub fn set(&self, p: People) {
+        let _ = self.table.set(p);
+        *self.ready.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+    /// Wait until `set` has run.
+    pub fn wait(&self) -> &People {
+        if let Some(p) = self.table.get() {
+            return p;
+        }
+        let mut r = self.ready.lock().unwrap();
+        while !*r {
+            r = self.cv.wait(r).unwrap();
+        }
+        drop(r);
+        self.table.get().expect("people table")
+    }
+}
+
 pub struct People {
     mask: usize,
     slots: Vec<(u64, u64)>,

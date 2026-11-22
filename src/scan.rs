@@ -17,6 +17,9 @@
 //! Cost: O(bytes / 32) block operations + O(1) per comma/newline, instead of
 //! one `memchr` call per field.
 
+/// How far ahead of the scan position input bytes are prefetched.
+const PREFETCH: usize = 1024;
+
 #[inline(always)]
 fn masks_scalar(b: &[u8; 32]) -> (u32, u32, u32) {
     let (mut nl, mut cm, mut qt) = (0u32, 0u32, 0u32);
@@ -122,6 +125,18 @@ pub fn scan<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N]
             tail[..n - base].copy_from_slice(&data[base..]);
             &tail
         };
+        // The input streams from the page cache through a file mapping;
+        // the hardware prefetcher stops at every 4 KB page, so hint ahead.
+        #[cfg(target_arch = "x86_64")]
+        if base + PREFETCH < n {
+            // SAFETY: prefetch of an in-bounds address; nothing is read.
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    data.as_ptr().add(base + PREFETCH) as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0,
+                )
+            };
+        }
         let (nl, cm, mut qt) = masks(block);
         let mut m = nl | cm;
         while m != 0 {
