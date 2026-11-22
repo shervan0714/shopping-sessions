@@ -14,11 +14,19 @@ use crate::sys::FastMap;
 const EMPTY: u64 = u64::MAX;
 
 /// Person partitions for the session stage (by hash of the person key).
-pub const PP_BITS: u32 = 8;
-pub const PP: usize = 1 << PP_BITS;
+/// Sized from the input before parsing (`set_pp_bits`): about 20K events
+/// each, so a partition's grouping table and rows stay cache-resident.
+static PP_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8);
+pub fn set_pp_bits(b: u32) {
+    PP_BITS.store(b, std::sync::atomic::Ordering::Relaxed);
+}
+/// The number of person partitions.
+pub fn pp() -> usize {
+    1 << PP_BITS.load(std::sync::atomic::Ordering::Relaxed)
+}
 #[inline(always)]
 pub fn ppart(k: u64) -> usize {
-    (mix(k) >> (64 - PP_BITS)) as usize
+    (mix(k) >> (64 - PP_BITS.load(std::sync::atomic::Ordering::Relaxed))) as usize
 } // never a key: packed keys use 60 bits, exotic ones 63+32
 
 /// The people table, published once by the thread that builds it; readers

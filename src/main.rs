@@ -29,7 +29,7 @@ mod sys;
 mod ts;
 
 use input::Lookups;
-use parse::{ClickRow, EvRow, Worker, EV_PARTS, EV_PART_BITS, KIND_PURCHASE};
+use parse::{ClickRow, EvRow, Worker, KIND_PURCHASE};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Mutex;
@@ -56,7 +56,7 @@ struct Surv {
     cat: u32,
 }
 
-use people::{ppart, PP};
+use people::ppart;
 
 /// A raw pointer that may be shared between threads; every user writes or
 /// borrows disjoint ranges only.
@@ -195,6 +195,19 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     let release_chunks = (total_bytes as f64) * 2.2 > mem_bytes * 0.8;
     let build = if cfg!(target_feature = "avx512f") { "avx512" } else { "avx2" };
     log(t0, &format!("mapped {} files, {:.1} MB, {} chunks, release chunks: {release_chunks}, build: {build}", files.len(), total_bytes as f64 / 1e6, tasks.len()));
+    // Bucket counts from the input size (an event line is ~95 bytes): about
+    // 40K rows per dedup bucket and 20K events per person partition, powers
+    // of two, so each stage's per-bucket table stays in cache at any scale.
+    let ev_bytes: usize = mapped.iter().filter(|m| m.0 == 0).map(|m| m.1.len()).sum();
+    let ev_rows = ev_bytes / 95 + 1;
+    let log2_near = |x: usize| (x.max(1) as f64).log2().round() as u32;
+    let env_bits = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<u32>().ok()).map(|b| b.clamp(0, 16));
+    // SS_EV_BITS / SS_PP_BITS override the sizing (for tuning on scorer-like hardware).
+    let ev_bits = env_bits("SS_EV_BITS").unwrap_or_else(|| log2_near(ev_rows / 40_000).clamp(4, 14));
+    let pp_bits = env_bits("SS_PP_BITS").unwrap_or_else(|| log2_near(ev_rows / 20_000).clamp(4, 14));
+    parse::set_ev_bits(ev_bits);
+    people::set_pp_bits(pp_bits);
+    log(t0, &format!("buckets: {} dedup, {} person (~{ev_rows} event rows)", 1usize << ev_bits, 1usize << pp_bits));
     // Leaked so the readahead thread can follow the parsers' progress.
     let tasks: &'static [Task] = Box::leak(tasks.into_boxed_slice());
     let next: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
@@ -241,8 +254,9 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     log(t0, &format!("people: {} linked ids, {} merged into another person", people.n_ids, people.n_merged));
 
     // ---- 3. regroup worker output ---------------------------------------------
-    let mut buckets: Vec<Vec<&'static [EvRow]>> = (0..EV_PARTS).map(|_| Vec::new()).collect();
-    let mut cl_parts: Vec<Vec<&'static [ClickRow]>> = (0..PP).map(|_| Vec::new()).collect();
+    let (ev_parts_n, pp) = (parse::ev_parts(), people::pp());
+    let mut buckets: Vec<Vec<&'static [EvRow]>> = (0..ev_parts_n).map(|_| Vec::new()).collect();
+    let mut cl_parts: Vec<Vec<&'static [ClickRow]>> = (0..pp).map(|_| Vec::new()).collect();
     for w in workers {
         let (blocks, clicks) = w.into_parts();
         for (p, b) in blocks.into_iter().enumerate() {
@@ -257,12 +271,12 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     // Survivors go straight into per-thread block chains, one per person
     // partition (no intermediate array, no second scatter pass).
     let writers = par::each(
-        EV_PARTS,
-        |_| (alloc::Parts::<Surv>::new(PP, alloc::POOL_BLOCK / std::mem::size_of::<Surv>()), 0usize),
+        ev_parts_n,
+        |_| (alloc::Parts::<Surv>::new(pp, alloc::POOL_BLOCK / std::mem::size_of::<Surv>()), 0usize),
         |(out, n), p| *n += dedup(&buckets[p], people, out),
     );
     let n_surv: usize = writers.iter().map(|w| w.1).sum();
-    let mut ev_parts: Vec<Vec<&'static [Surv]>> = (0..PP).map(|_| Vec::new()).collect();
+    let mut ev_parts: Vec<Vec<&'static [Surv]>> = (0..pp).map(|_| Vec::new()).collect();
     for (w, _) in writers {
         for (p, b) in w.finish().into_iter().enumerate() {
             ev_parts[p].extend(b);
@@ -293,7 +307,7 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     {
         let cl_parts = &cl_parts;
         // Largest partitions first, so no big one starts last.
-        let mut order: Vec<usize> = (0..PP).collect();
+        let mut order: Vec<usize> = (0..pp).collect();
         let ev_len: Vec<usize> = ev_parts.iter().map(|v| v.iter().map(|b| b.len()).sum()).collect();
         order.sort_unstable_by_key(|&p| std::cmp::Reverse(ev_len[p]));
         let ev_parts = &ev_parts;
@@ -518,8 +532,6 @@ fn group_partition(blocks: &[&'static [Surv]], cls: &[&'static [ClickRow]], g: &
 /// Reused per-thread dedup scratch.
 #[derive(Default)]
 struct DedupScratch {
-    tmp: Vec<(u64, u32)>,
-    pairs: Vec<(u64, u32)>,
     table: Vec<(u64, u32)>,
     win: Vec<u64>,
     keep: Vec<u32>,
@@ -530,52 +542,28 @@ thread_local! {
     static DEDUP: std::cell::RefCell<DedupScratch> = std::cell::RefCell::new(DedupScratch::default());
 }
 
-const DD_SUB_BITS: u32 = 4;
-const DD_SUB: usize = 1 << DD_SUB_BITS;
-
-/// Dedup one hash partition (rules.md events steps 2-4): for each event_id,
+/// Dedup one hash bucket (rules.md events steps 2-4): for each event_id,
 /// keep the copy with the smallest ingest_ts; drop it if invalid or late.
-/// The rows are split once more into DD_SUB sub-partitions so each
-/// open-addressing table (event_id key -> row) stays cache-resident. Rows stay
-/// in their blocks (row index = block << 11 | offset).
+/// Buckets are sized (~40K rows) so one open-addressing table (event_id key
+/// -> row) per bucket stays cache-resident. Rows stay in their blocks (row
+/// index = block << 11 | offset).
 fn dedup(blocks: &[&'static [EvRow]], people: &people::People, out: &mut alloc::Parts<Surv>) -> usize {
     const EMPTY: u64 = u64::MAX;
     const _: () = assert!(parse::BLOCK == 1 << 11);
     let row = |i: u32| -> &EvRow { &blocks[(i >> 11) as usize][(i & 2047) as usize] };
-    let sub = |k: u64| ((idkey::mix(k) >> (64 - EV_PART_BITS - DD_SUB_BITS)) as usize) & (DD_SUB - 1);
     DEDUP.with(|cell| {
         let sc = &mut *cell.borrow_mut();
         let total: usize = blocks.iter().map(|b| b.len()).sum();
-        sc.tmp.clear();
         // One bit per row index (all zero between calls).
         sc.win.resize(blocks.len() * parse::BLOCK / 64, 0);
-        let mut cnt = [0usize; DD_SUB + 1];
+        let cap = (total + total / 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        sc.table.clear();
+        sc.table.resize(cap, (EMPTY, 0));
+        let table = &mut sc.table;
         for (bi, b) in blocks.iter().enumerate() {
             for (o, r) in b.iter().enumerate() {
-                sc.tmp.push((r.eid, (bi as u32) << 11 | o as u32));
-                cnt[sub(r.eid) + 1] += 1;
-            }
-        }
-        for i in 0..DD_SUB {
-            cnt[i + 1] += cnt[i];
-        }
-        sc.pairs.clear();
-        sc.pairs.resize(total, (0, 0));
-        let mut pos = cnt;
-        for &(k, i) in &sc.tmp {
-            let s = sub(k);
-            sc.pairs[pos[s]] = (k, i);
-            pos[s] += 1;
-        }
-        let mut kept = 0usize;
-        for s in 0..DD_SUB {
-            let part = &sc.pairs[cnt[s]..cnt[s + 1]];
-            let cap = (part.len() * 2).next_power_of_two().max(16);
-            let mask = cap - 1;
-            sc.table.clear();
-            sc.table.resize(cap, (EMPTY, 0));
-            let table = &mut sc.table;
-            for &(k, me) in part {
+                let (k, me) = (r.eid, (bi as u32) << 11 | o as u32);
                 let mut h = (idkey::mix(k) as usize) & mask;
                 loop {
                     let slot = &mut table[h];
@@ -586,7 +574,7 @@ fn dedup(blocks: &[&'static [EvRow]], people: &people::People, out: &mut alloc::
                     if slot.0 == k {
                         // Keep the smaller ingest_ts (copies with equal
                         // ingest_ts are identical, so either is right).
-                        if row(me).ingest < row(slot.1).ingest {
+                        if r.ingest < row(slot.1).ingest {
                             slot.1 = me;
                         }
                         break;
@@ -594,13 +582,14 @@ fn dedup(blocks: &[&'static [EvRow]], people: &people::People, out: &mut alloc::
                     h = (h + 1) & mask;
                 }
             }
-            // Mark the kept copies; rows are then read in block order.
-            for &(k, i) in table.iter() {
-                if k != EMPTY {
-                    sc.win[(i >> 6) as usize] |= 1 << (i & 63);
-                }
+        }
+        // Mark the kept copies; rows are then read in block order.
+        for &(k, i) in table.iter() {
+            if k != EMPTY {
+                sc.win[(i >> 6) as usize] |= 1 << (i & 63);
             }
         }
+        let mut kept = 0usize;
         // Emit the kept valid copies (invalid and late ones were marked
         // KIND_INVALID while parsing). Person lookups are random reads, so
         // they are prefetched a few rows ahead.

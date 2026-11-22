@@ -5,7 +5,7 @@ use crate::scan::scan;
 use crate::input::Lookups;
 use crate::idkey::{key, mix};
 use crate::alloc::{Blocks, Parts, POOL_BLOCK};
-use crate::people::{ppart, PeopleSlot, PP};
+use crate::people::{pp, ppart, PeopleSlot};
 use crate::intern::Interner;
 use crate::ts::{self, DAY};
 
@@ -22,8 +22,16 @@ pub const KIND_PURCHASE: u8 = 3;
 /// threshold set in main, so each block is its own mapping and is returned to
 /// the OS the moment dedup has copied it (keeping peak memory near the size
 /// of the parsed rows). Only the tail of each open block is hot in cache.
-pub const EV_PART_BITS: u32 = 8;
-pub const EV_PARTS: usize = 1 << EV_PART_BITS;
+/// The count is sized from the input before parsing (`set_ev_bits`): about
+/// 40K rows per bucket, so one dedup table per bucket stays cache-resident.
+static EV_PART_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8);
+pub fn set_ev_bits(b: u32) {
+    EV_PART_BITS.store(b, std::sync::atomic::Ordering::Relaxed);
+}
+/// The number of event buckets.
+pub fn ev_parts() -> usize {
+    1 << EV_PART_BITS.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub const BLOCK: usize = 2048;
 
 /// One parsed (well-formed, non-empty `event_id`) event line. Every copy of
@@ -44,10 +52,6 @@ pub struct EvRow {
 }
 
 impl EvRow {
-    #[inline(always)]
-    pub fn part(&self) -> usize {
-        (mix(self.eid) >> (64 - EV_PART_BITS)) as usize
-    }
     #[inline(always)]
     pub fn kind(&self) -> u8 {
         (self.price_kind >> 24) as u8
@@ -84,6 +88,8 @@ pub struct Worker {
     /// Full blocks per event bucket.
     full: Vec<Vec<&'static [EvRow]>>,
     arena: Blocks<EvRow>,
+    /// 64 - log2(bucket count): the bucket is the top bits of mix(eid).
+    shift: u32,
     pub n_events: usize,
     /// Valid clicks, already in person partitions.
     pub clicks: Parts<ClickRow>,
@@ -96,21 +102,23 @@ unsafe impl Send for Worker {}
 impl Worker {
     pub fn new() -> Self {
         let mut arena = Blocks::new(BLOCK);
+        let n = ev_parts();
         Worker {
-            open: (0..EV_PARTS).map(|_| arena.take()).collect(),
-            open_len: vec![0; EV_PARTS],
-            full: (0..EV_PARTS).map(|_| Vec::new()).collect(),
+            open: (0..n).map(|_| arena.take()).collect(),
+            open_len: vec![0; n],
+            full: (0..n).map(|_| Vec::new()).collect(),
             arena,
+            shift: 64 - n.trailing_zeros(),
             n_events: 0,
-            clicks: Parts::new(PP, POOL_BLOCK / std::mem::size_of::<ClickRow>()),
+            clicks: Parts::new(pp(), POOL_BLOCK / std::mem::size_of::<ClickRow>()),
             n_clicks: 0,
         }
     }
 
     #[inline(always)]
     fn push_event(&mut self, row: EvRow) {
-        let p = row.part();
-        // SAFETY: p < EV_PARTS; the open block has room (it is replaced as
+        let p = if self.shift == 64 { 0 } else { (mix(row.eid) >> self.shift) as usize };
+        // SAFETY: p < the bucket count; the open block has room (it is replaced as
         // soon as it fills).
         unsafe {
             let n = self.open_len.get_unchecked_mut(p);
@@ -129,7 +137,7 @@ impl Worker {
     /// Every block of each bucket (full ones and the open one).
     pub fn into_parts(self) -> (Vec<Vec<&'static [EvRow]>>, Vec<Vec<&'static [ClickRow]>>) {
         let mut full = self.full;
-        for p in 0..EV_PARTS {
+        for p in 0..self.open.len() {
             if self.open_len[p] > 0 {
                 // SAFETY: the first open_len rows of the open block are written.
                 full[p].push(unsafe { std::slice::from_raw_parts(self.open[p], self.open_len[p] as usize) });
