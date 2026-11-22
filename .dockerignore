@@ -1,8 +1,10 @@
 target/
-fixtures/
 dev/
 out/
 dev-answer/
-scripts/
 .git
 *.md
+# scripts/ is needed only for build.sh; fixtures/ trains the PGO profile.
+scripts/*
+!scripts/build.sh
+pgo/

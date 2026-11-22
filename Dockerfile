@@ -1,44 +1,26 @@
-# Shopping Sessions: one static native Rust binary, in two builds.
-# The scorers build this file natively on linux/amd64 (Google Cloud n2: Intel
-# Xeon, Cascade Lake or newer, AVX-512), so no FROM line pins a platform.
-
-# rustc 1.85.1 exactly: pgo/merged.profdata was made by this compiler
-# (scripts/pgo.sh) and must match its LLVM.
-FROM rust:1.85.1-slim-bookworm AS build
+# Shopping Sessions: one static native Rust binary, built with
+# profile-guided optimization inside this build (scripts/build.sh).
+#
+# TARGET_CPU (default cascadelake) is fixed at build time. The scorers run
+# GCP n2 (Intel Cascade Lake or Ice Lake, both AVX-512); a cascadelake build
+# runs on either, where `native` built on an Ice Lake host could use
+# instructions a Cascade Lake runner lacks. Override with
+#   docker build --build-arg TARGET_CPU=x86-64-v3 .   (any x86-64 with AVX2)
+FROM rust:1-slim AS build
+ARG TARGET_CPU=cascadelake
+# llvm-profdata, to merge the PGO profile.
+RUN rustup component add llvm-tools
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY pgo ./pgo
-# Two builds, both statically linked (glibc +crt-static: no dynamic loader
-# work at start) and both optimised with the profile:
-#   shopping-sessions         x86-64-v3 (AVX2/BMI2/FMA): runs on any scorer
-#   shopping-sessions-avx512  Cascade Lake (adds AVX-512)
-# At startup the first checks the CPU (CPUID) and runs the second only if
-# every feature it may use is there; if that build fails in any way, the
-# first clears its output and does the work itself (src/main.rs,
-# try_avx512_build).
-# An arm64 build (Apple-silicon dev loop) gets one plain static binary.
-RUN set -eu; \
-    T="$(uname -m)-unknown-linux-gnu"; \
-    STATIC="-C target-feature=+crt-static"; \
-    PGO="-Cprofile-use=/src/pgo/merged.profdata -Cllvm-args=-no-pgo-warn-mismatch"; \
-    mkdir -p /out; \
-    if [ "$(uname -m)" = "x86_64" ]; then \
-      RUSTFLAGS="-C target-cpu=x86-64-v3 $STATIC $PGO" \
-        cargo build --release --locked --target "$T"; \
-      cp "target/$T/release/shopping-sessions" /out/shopping-sessions; \
-      RUSTFLAGS="-C target-cpu=cascadelake $STATIC $PGO" CARGO_TARGET_DIR=target-avx512 \
-        cargo build --release --locked --target "$T"; \
-      cp "target-avx512/$T/release/shopping-sessions" /out/shopping-sessions-avx512; \
-    else \
-      RUSTFLAGS="$STATIC" cargo build --release --locked --target "$T"; \
-      cp "target/$T/release/shopping-sessions" /out/shopping-sessions; \
-    fi; \
-    strip /out/*
+COPY tools ./tools
+COPY fixtures ./fixtures
+COPY scripts/build.sh ./scripts/build.sh
+RUN mkdir -p /out && TARGET_CPU="$TARGET_CPU" sh scripts/build.sh /out/shopping-sessions
 
-# The binaries are static (no loader, no shared libraries at start), so the
-# base image costs nothing at run time. It is a small OS rather than `scratch`
-# because scripts/docker_run.sh runs `chmod` inside the image to clean up.
+# The binary is static (no loader, no shared libraries at start), so the
+# base image costs nothing at run time. It is a small OS rather than
+# `scratch` because scripts/docker_run.sh runs `chmod` inside the image.
 FROM debian:bookworm-slim
 # The scorer runs the container as uid 1000; give that uid a name and a home.
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app

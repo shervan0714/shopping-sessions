@@ -1,5 +1,45 @@
 # Performance report
 
+## Round 3 (branch `perf-round3`)
+
+Eight changes, one commit each, every one gated on: unit tests, the 36
+fixtures, the dev answer, byte-identical tables against `main` (c03ee97) on
+seven generated sets (seeds 2, 3, 4, 7, 15 with a 2028-02-29 window, 21, and
+a long-ID variant) at NCPU 1, 2 and 3, and `scripts/fuzz.py` (200 small + 4
+large rounds). Every alternative path was forced and fuzzed too (u128 rows,
+both assist paths, both input modes).
+
+Measured on a 2-vCPU Xeon sandbox (AVX-512) with 5M events, alternating A/B,
+medians (`scripts/ab.sh`). A shared, noisy box: same-binary runs drift by
+±8% between batches, so only alternating pairs are compared.
+
+| Change | Effect here |
+|---|---|
+| no crate dependencies (rayon, parquet, memmap2, memchr, hashbrown, xxhash, bytes) | neutral (0.968 vs 0.972 s); 0.74 MB binary, offline build |
+| bucket counts from the input; one dedup table per bucket | dedup −5 to −10%; at 5M rows/40K = 128 buckets, 512 was ~10 ms faster still: tune `SS_EV_BITS` on n2 |
+| packed u64 rows (u128 fallback) | neutral here; survivors 24 → 16 B |
+| forward-pass credit, small-person assists, day-segment jump | sessions −9% (1 thread), −4% (2 threads) |
+| per-worker pools, dead blocks reused, big-buffer recycling, background unmap | page faults per run 12.3K → 6.2K; sessions −9% |
+| `MADV_POPULATE_READ` 4 MB chunks (vs pread + readahead) | warm: 1 thread −7%, 2 threads equal; cold: no clear difference |
+| in-build PGO, one `cascadelake` binary, `rust:1` | not measurable here (no llvm-profdata offline); removes the re-exec |
+
+Not measured here: 8 vCPUs, 20M/60M, PGO's effect. **Measure on GCP n2:**
+
+```sh
+gcloud compute instances create ss-bench --machine-type=n2-standard-8 \
+  --min-cpu-platform="Intel Cascade Lake" --image-family=ubuntu-2404-lts-amd64 \
+  --image-project=ubuntu-os-cloud --boot-disk-size=100GB
+# on the VM: install docker + rust, build tools/generator, then
+generate --seed 5 --events 20000000 --clicks 5000000 --output d20
+docker build -t ss-new . && git stash && docker build -t ss-old . && git stash pop
+# or natively: two binaries, alternating, 11 rounds, pinned to 8 vCPUs
+taskset -c 0-7 scripts/ab.sh old/shopping-sessions target/release/shopping-sessions d20 11 8
+A_ENV="SS_INPUT=pread" taskset -c 0-7 scripts/ab.sh BIN BIN d20 11 8     # input modes
+A_ENV="SS_EV_BITS=10" B_ENV="SS_EV_BITS=9" scripts/ab.sh BIN BIN d20 11 8 # bucket counts
+python3 scripts/fuzz.py target/release/shopping-sessions                    # after every change
+```
+
+
 Every number here was measured; nothing is extrapolated.
 
 ## Machine

@@ -8,7 +8,7 @@ ANSWER ?= dev-answer
 PY ?= python3
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: build fixtures dev run-dev check-dev native native-fixtures native-dev unit cross-check fuzz pgo
+.PHONY: build fixtures dev run-dev check-dev native native-fixtures native-dev unit cross-check fuzz ab
 
 ## Build the image for the scorer's platform
 build:
@@ -53,8 +53,12 @@ cross-check: native
 fuzz: native
 	$(PY) scripts/fuzz.py target/release/shopping-sessions
 
-## Regenerate pgo/merged.profdata after a source change (needs
-## `rustup toolchain install 1.85.1 -c llvm-tools-preview`; PGO_DATA = data dirs to train on)
-PGO_DATA ?= $(DEV)
-pgo:
-	scripts/pgo.sh $(PGO_DATA)
+## Alternating A/B of two binaries (or one binary, two env settings) on a
+## dataset; medians per stage. See PERFORMANCE.md for the GCP n2 recipe.
+##   make ab A=old/shopping-sessions B=target/release/shopping-sessions DATA=d20 ROUNDS=11
+A ?= target/release/shopping-sessions
+B ?= target/release/shopping-sessions
+DATA ?= $(DEV)
+ROUNDS ?= 9
+ab:
+	scripts/ab.sh $(A) $(B) $(DATA) $(ROUNDS) $(CPUS)

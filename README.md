@@ -1,6 +1,6 @@
 # Shopping Sessions — native Rust solution
 
-A single, dependency-light Rust binary that implements `rules.md` exactly and
+A single, dependency-free (std only) Rust binary that implements `rules.md` exactly and
 runs the whole pipeline (CSV → dedup → identity resolution → sessions →
 attribution → Parquet) in one process with no engine startup cost.
 
@@ -18,7 +18,7 @@ make run-dev          # image on dev/ with scorer flags, timed
 make check-dev        # exact diff against dev-answer/ (dev-answer.zip unzipped here)
 ```
 
-Without Docker (Rust ≥ 1.85, Python with `polars` for the checkers):
+Without Docker (any recent stable Rust; Python with `polars` for the checkers):
 
 ```sh
 make native-fixtures                 # cargo build --release + 36 fixtures
@@ -26,7 +26,7 @@ make native-dev check-dev            # dev set + exact diff
 make unit                            # unit tests (timestamps, CSV dialect, SIMD scanner fuzz, keys)
 make cross-check                     # Rust vs scripts/reference.py on freshly generated seeds
 make fuzz                            # mutation fuzzer vs scripts/reference.py (required before any speed change)
-make pgo PGO_DATA="p20 dev"           # regenerate pgo/merged.profdata after a source change (rustc 1.85.1)
+make ab A=old B=new DATA=d20         # alternating A/B, medians per stage (scripts/ab.sh; PERFORMANCE.md)
 ```
 
 The binary reads `DATA_DIR`/`OUTPUT_DIR` (default `/data`, `/output`) or the
@@ -34,11 +34,20 @@ last two command-line arguments, and `NCPU` for its thread count. It writes
 only `$OUTPUT_DIR/user_daily/*.parquet` and `$OUTPUT_DIR/campaign_daily/*.parquet`;
 diagnostics (stage timings) go to stderr. It needs no scratch space.
 
-The image holds two static, profile-optimised builds: `shopping-sessions`
-(x86-64-v3, AVX2) and `shopping-sessions-avx512` (Cascade Lake). The first
-checks the CPU at startup and runs the second only if every feature it may use
-is present; if that build fails in any way, the first clears its output and
-does the work itself (`SS_NO_AVX512=1` disables the hand-off).
+The image holds one static binary built for `TARGET_CPU` (build arg, default
+`cascadelake`: runs on every GCP n2, Cascade Lake or Ice Lake) with
+profile-guided optimization recorded **inside** `docker build`
+(`scripts/build.sh`): the build compiles the published generator
+(`tools/generator`), makes a 2M-event training set, runs an instrumented
+binary on it and on the fixtures, merges the profile with `llvm-profdata`
+and builds again. The profile therefore always matches the compiler and the
+source; nothing is checked in. If training cannot run on the build host, the
+final build is the same minus PGO (the build log says which).
+
+Tuning knobs (environment; defaults are what the scorer gets):
+`SS_INPUT=populate|pread`, `SS_READAHEAD=1` / `SS_NO_READAHEAD=1`,
+`SS_EV_BITS` / `SS_PP_BITS` (log2 bucket counts), `SS_KEEP_MAPS=1`; test-only:
+`SS_WIDE=1` (u128 rows), `SS_SMALL_CLICKS=N` (assist path threshold).
 
 ## Why Rust (and not Polars / DuckDB / Spark)
 
@@ -56,13 +65,13 @@ does the work itself (`SS_NO_AVX512=1` disables the hand-off).
 
 | Stage | What | Complexity / memory |
 |---|---|---|
-| 1. map | `mmap` every CSV, cut bodies into ~4 MB line-aligned chunks. A background thread issues `MADV_WILLNEED` at most ~128 chunks ahead of the parsers; each parsed chunk is released with `MADV_DONTNEED`, so the inputs' page-cache footprint stays bounded. | O(files) |
-| 2. parse | Link files first (small), in parallel; then the people table is built on its own thread while all event and click chunks are parsed by work-stealing on `NCPU` threads. A SIMD structural scanner (`src/scan.rs`, AVX2/SSE2 bitmasks for `\n`, `,`, `"`) finds fields in one pass; quote validity is checked by popcount (quotes in the line must equal 2 × wrapped fields), which is provably the same rule as the simple splitter in `src/csv.rs` and is fuzz-tested against it. Timestamps: SWAR time-of-day plus a small per-thread memo of validated dates (`src/ts.rs`, fuzzed against the plain parser). **Every ID becomes an exact 64-bit key** (`src/idkey.rs`): 1–10 bytes of `[0-9A-Z_a-z]` are packed 6 bits per byte so that integer order is byte order and integer equality is string equality; any other ID is interned exactly and flagged, and comparisons involving it use the real bytes. No locks, hashing or string copies on the hot path. Events are validated (including the late check) and appended to fixed 2048-row blocks, one chain per `event_id`-key bucket (256), carved from per-worker huge-page arenas (`src/alloc.rs`). Products are looked up only for purchases. | O(bytes); 40 B per event row, 32 B per click |
+| 1. map | `mmap` every CSV (in parallel), cut bodies into 4 MB line-aligned chunks. Each chunk is prefaulted with one `MADV_POPULATE_READ` and parsed from the mapping (`SS_INPUT=pread`: 512 KB `pread` copies plus a readahead thread). Bucket counts are sized from the input bytes: ~40K rows per dedup bucket, ~20K events per person partition. After parsing, the input mappings are unmapped on a background thread. | O(files) |
+| 2. parse | Link files first (small), in parallel; then the people table is built on its own thread while all event and click chunks are parsed by work-stealing on `NCPU` threads. A SIMD structural scanner (`src/scan.rs`, AVX2/SSE2 bitmasks for `\n`, `,`, `"`) finds fields in one pass; quote validity is checked by popcount (quotes in the line must equal 2 × wrapped fields), which is provably the same rule as the simple splitter in `src/csv.rs` and is fuzz-tested against it. Timestamps: SWAR time-of-day plus a small per-thread memo of validated dates (`src/ts.rs`, fuzzed against the plain parser). **Every ID becomes an exact 64-bit key** (`src/idkey.rs`): 1–10 bytes of `[0-9A-Z_a-z]` are packed 6 bits per byte so that integer order is byte order and integer equality is string equality; any other ID is interned exactly and flagged, and comparisons involving it use the real bytes. No locks, hashing or string copies on the hot path. Events are validated (including the late check) and appended to fixed 2048-row blocks, one chain per `event_id`-key bucket, carved from per-worker huge-page arenas (`src/alloc.rs`). Products are looked up only for purchases. | O(bytes); 40 B per event row, 32 B per click |
 | 3. people | Union–find (union by size, path halving) over the linked IDs only; each component is named by its byte-wise smallest ID. The result is an open-addressing table linked-ID-key → person-key with a bit filter in front; every unlinked ID is its own person (`src/people.rs`). | O(links · α) |
-| 4. dedup | Per bucket, in parallel: the rows are split into 16 sub-buckets so each hash table (event key → copy with the smallest ingest_ts) stays in cache; kept copies are read back in row order, invalid/late ones dropped, and the person lookup is software-prefetched two stages ahead. Survivors are appended straight to per-thread block chains, one per person partition (256, by hash of the person key). Keys are exact, so there are no collisions to resolve. | O(n) |
-| 5. clicks | Valid clicks get their person key and are scattered into the same 256 person partitions. | O(clicks) |
-| 6. sessions | Per person partition, in parallel, largest first: group the events by person with a hash table, attach each person's clicks (clicks of persons with no events are dropped: they cannot credit or assist), sort each person's events by ts and clicks by (ts, click_id). Then sessions are cut at gaps > 30 min (equal timestamps always share a session), day = UTC date of the start. Credit: binary search for the last click with ts ≤ start, then the first click with that ts (smallest click_id), organic if none within 7 days. Assists: per campaign, the click intervals [ts, ts+7d] are merged and every session whose start falls in a merged interval is counted once, by binary search over the session starts and the person's day segments, never sessions × clicks. top_category: highest purchase sum, ties to the byte-wise smallest name, `unknown` included. | O(n log k), k = events per person |
-| 7. output | Parquet (plain, uncompressed, no dictionary), `user_daily` cut into ~4 files per thread written in parallel (names passed as zero-copy slices of one buffer per file) plus one `campaign_daily` file; `day` is INT32 `DATE`. | O(rows) |
+| 4. dedup | Per bucket, in parallel: one hash table per bucket (event key → copy with the smallest ingest_ts; buckets are sized to keep it cache-resident); kept copies are read back in row order, invalid/late ones dropped, and the person lookup is software-prefetched two stages ahead. Survivors are appended straight to per-thread block chains, one per person partition (by hash of the person key). Keys are exact, so there are no collisions to resolve. | O(n) |
+| 5. clicks | Valid clicks get their person key and are scattered into the same person partitions. | O(clicks) |
+| 6. sessions | Per person partition, in parallel, largest first: group the events by person with a hash table, attach each person's clicks (clicks of persons with no events are dropped: they cannot credit or assist), events and clicks are packed into `u64` words (`src/pack.rs`: ts offset on top, then price and category, or campaign; `u128` when the window or category count does not fit), so sorting is plain integer sorting; a person with two clicks at the same ms is sorted by (ts, click_id) exactly. Then sessions are cut at gaps > 30 min (equal timestamps always share a session), day = UTC date of the start. Credit: one forward pass over the clicks for all of a person's sessions (latest click with ts ≤ start, first of its ts run = smallest click_id; organic if none within 7 days). Assists: a person with ≤ 16 clicks slides the 7-day window over clicks and sessions and counts distinct campaigns directly; otherwise per campaign the click intervals [ts, ts+7d] are merged and every session whose start falls in one is counted once, by binary search over the session starts, starting at the right day segment. A partition's row blocks go back to the worker's pool once grouped; user rows reuse them. top_category: highest purchase sum, ties to the byte-wise smallest name, `unknown` included. | O(n log k), k = events per person |
+| 7. output | Parquet via `src/pq.rs` (PLAIN, uncompressed, no dictionary, no statistics; thrift-compact footer), `user_daily` cut into ~4 files per thread written in parallel plus one `campaign_daily` file; `day` is INT32 `DATE`. | O(rows) |
 
 Click duplicates are not removed: rules.md guarantees copies are identical,
 and neither crediting (latest ts, then smallest id) nor assisting (distinct
@@ -91,7 +100,8 @@ All of these were run, not assumed:
   generator seeds (2–12, 15, 16; 150K–2M events; windows from 2025 to 2028,
   including seed 15 whose window contains 2028-02-29).
 * `scripts/fuzz.py`, a mutation fuzzer, writes datasets aimed at the rules'
-  edges (IDs of 11–300 bytes, spaces, ``, tabs, non-ASCII and emoji, case
+  edges (IDs of 11–300 bytes, spaces, `
+`, tabs, non-ASCII and emoji, case
   variants; link chains, self-links, shared devices; duplicate events with
   other ingest times; every bad timestamp form and window edge; 30:00.000 and
   30:00.001 gaps; 7-day click edges and same-ms click ties; quoted fields,

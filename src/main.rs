@@ -91,55 +91,6 @@ fn log(t0: Instant, what: &str) {
     eprintln!("[{:8.3}s] {what}", t0.elapsed().as_secs_f64());
 }
 
-/// The image holds two builds of this program: this one (x86-64-v3: AVX2,
-/// runs on any scorer) and `<this>-avx512`, built for Cascade Lake. When the
-/// CPU has every feature that build may use, run it (same arguments and
-/// environment) and finish with its success. If anything is off (a feature
-/// or the file missing, `SS_NO_AVX512` set, or that build failing in any way,
-/// a crash included), clear whatever it wrote and do the work here instead.
-/// `SS_FORCE_AVX512` skips the CPU check (to test that fallback on a CPU
-/// without AVX-512, where the other build dies of an illegal instruction).
-#[cfg(all(target_arch = "x86_64", target_os = "linux", not(target_feature = "avx512f")))]
-fn try_avx512_build(out_dir: &Path) {
-    if std::env::var_os("SS_NO_AVX512").is_some() {
-        return;
-    }
-    let cpu_ok = std::env::var_os("SS_FORCE_AVX512").is_some()
-        || (is_x86_feature_detected!("avx512f")
-            && is_x86_feature_detected!("avx512cd")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512dq")
-            && is_x86_feature_detected!("avx512vl")
-            && is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("adx")
-            && is_x86_feature_detected!("rdseed"));
-    if !cpu_ok {
-        return;
-    }
-    let Ok(me) = std::env::current_exe() else { return };
-    let mut alt = me.into_os_string();
-    alt.push("-avx512");
-    let alt = PathBuf::from(alt);
-    if !alt.is_file() {
-        return;
-    }
-    let status = std::process::Command::new(&alt)
-        .args(std::env::args_os().skip(1))
-        .env("SS_NO_AVX512", "1")
-        .env_remove("SS_FORCE_AVX512")
-        .status();
-    if matches!(status, Ok(s) if s.success()) {
-        std::process::exit(0);
-    }
-    eprintln!("avx512 build failed ({status:?}); running the avx2 build");
-    for t in ["user_daily", "campaign_daily"] {
-        let _ = std::fs::remove_dir_all(out_dir.join(t));
-    }
-}
-
-#[cfg(not(all(target_arch = "x86_64", target_os = "linux", not(target_feature = "avx512f"))))]
-fn try_avx512_build(_: &Path) {}
-
 fn main() {
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
@@ -149,7 +100,6 @@ fn main() {
     } else {
         (PathBuf::from(env("DATA_DIR", "/data")), PathBuf::from(env("OUTPUT_DIR", "/output")))
     };
-    try_avx512_build(&out_dir);
     let ncpu = std::env::var("NCPU")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -216,7 +166,7 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     // size) would crowd the memory limit (MEM_GB, default 24).
     let mem_bytes = std::env::var("MEM_GB").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(24.0) * 1e9;
     let release_chunks = (total_bytes as f64) * 2.2 > mem_bytes * 0.8;
-    let build = if cfg!(target_feature = "avx512f") { "avx512" } else { "avx2" };
+    let build = if cfg!(target_feature = "avx512f") { "avx512" } else if cfg!(target_feature = "avx2") { "avx2" } else { "baseline" };
     log(t0, &format!("mapped {} files, {:.1} MB, {} chunks, input {mode:?}, release chunks: {release_chunks}, build: {build}", files.len(), total_bytes as f64 / 1e6, tasks.len()));
     // Bucket counts from the input size (an event line is ~95 bytes): about
     // 40K rows per dedup bucket and 20K events per person partition, powers
