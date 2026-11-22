@@ -699,11 +699,11 @@ thread_local! {
 /// (no payload). Every other copy's payload is marked DEAD. Buckets are
 /// sized (~40K records) so one open-addressing table (event_id key ->
 /// record) per bucket stays cache-resident. Records stay in their blocks
-/// (index = block << 11 | offset). Returns the number of kept valid copies.
+/// (index = block << BLOCK_BITS | offset). Returns the number of kept valid copies.
 fn dedup(blocks: &[&'static [Cand]]) -> usize {
     const EMPTY: u64 = u64::MAX;
-    const _: () = assert!(parse::BLOCK == 1 << 11);
-    let row = |i: u32| -> &Cand { &blocks[(i >> 11) as usize][(i & 2047) as usize] };
+    const B: u32 = parse::BLOCK_BITS;
+    let row = |i: u32| -> &Cand { &blocks[(i >> B) as usize][(i & ((1 << B) - 1)) as usize] };
     // SAFETY: a payload belongs to exactly one record, and each record is in
     // one bucket, so no two threads write the same payload; nothing reads
     // payloads until dedup has finished.
@@ -722,7 +722,7 @@ fn dedup(blocks: &[&'static [Cand]]) -> usize {
         let table = &mut sc.table;
         for (bi, b) in blocks.iter().enumerate() {
             for (o, r) in b.iter().enumerate() {
-                let (k, me) = (r.eid, (bi as u32) << 11 | o as u32);
+                let (k, me) = (r.eid, (bi as u32) << B | o as u32);
                 let mut h = (idkey::mix(k) as usize) & mask;
                 loop {
                     let slot = &mut table[h];

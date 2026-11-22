@@ -223,7 +223,13 @@ impl<T: Copy + 'static> Parts<T> {
 /// One pool per worker thread (`par::tid`), so a worker puts and takes its
 /// own slots without contention; a worker whose pool is empty tries the
 /// others (non-blocking) before mapping fresh memory.
-pub const POOL_BLOCK: usize = 81920;
+///
+/// Small on purpose: each worker keeps one open block per event bucket and
+/// per person partition, and with 6 KB slots those open blocks (and the
+/// fresh pages behind them) stay small enough to remain cache-resident.
+/// Measured on 20M events: 80 KB slots 1326 ms, 12 KB 1271, 6 KB 1222,
+/// 3 KB 1232 (median total, 8 threads).
+pub const POOL_BLOCK: usize = 6144;
 const NPOOL: usize = 64;
 static POOLS: [Mutex<Vec<usize>>; NPOOL] = [const { Mutex::new(Vec::new()) }; NPOOL];
 /// Slots in all pools (approximate): skip the scan when there are none.

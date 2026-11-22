@@ -40,7 +40,9 @@ pub fn set_ev_bits(b: u32) {
 pub fn ev_parts() -> usize {
     1 << EV_PART_BITS.load(std::sync::atomic::Ordering::Relaxed)
 }
-pub const BLOCK: usize = 2048;
+/// Event records per block: 256 x 24 bytes fills one 6 KB pool slot.
+pub const BLOCK_BITS: u32 = 8;
+pub const BLOCK: usize = 1 << BLOCK_BITS;
 
 /// The dedup record of one parsed (well-formed, non-empty `event_id`) event
 /// line. Every copy of an event takes part in dedup, valid or not; a copy that
