@@ -556,14 +556,17 @@ impl<T> Default for Group<T> {
 fn group_partition<T: Pack>(blocks: &[&'static [Surv<T>]], cls: &[&'static [ClickRow]], g: &mut Group<T>) {
     const EMPTY: u64 = u64::MAX;
     let n: usize = blocks.iter().map(|b| b.len()).sum();
-    let cap = (2 * n).next_power_of_two().max(16);
-    let mask = cap - 1;
+    // Sized for the persons, not the events (a person has ~18 events on
+    // average): a table that stays in L1/L2 and is cheap to clear. It
+    // doubles whenever it gets half full.
+    let mut cap = (n / 8).next_power_of_two().max(256);
+    let mut mask = cap - 1;
     g.table.clear();
     g.table.resize(cap, (EMPTY, 0));
     g.persons.clear();
     g.pidx.clear();
     g.ev_off.clear();
-    let find = |table: &[(u64, u32)], k: u64| -> Option<u32> {
+    let find = |table: &[(u64, u32)], mask: usize, k: u64| -> Option<u32> {
         let mut h = idkey::mix(k) as usize & mask;
         loop {
             let (x, v) = table[h];
@@ -593,6 +596,20 @@ fn group_partition<T: Pack>(blocks: &[&'static [Surv<T>]], cls: &[&'static [Clic
                     *slot = (k, pi);
                     g.persons.push(k);
                     g.ev_off.push(0);
+                    if 2 * g.persons.len() > cap {
+                        // Grow: rebuild the table at twice the size.
+                        cap *= 2;
+                        mask = cap - 1;
+                        g.table.clear();
+                        g.table.resize(cap, (EMPTY, 0));
+                        for (i, &q) in g.persons.iter().enumerate() {
+                            let mut h = idkey::mix(q) as usize & mask;
+                            while g.table[h].0 != EMPTY {
+                                h = (h + 1) & mask;
+                            }
+                            g.table[h] = (q, i as u32);
+                        }
+                    }
                     break pi;
                 }
                 h = (h + 1) & mask;
@@ -636,7 +653,7 @@ fn group_partition<T: Pack>(blocks: &[&'static [Surv<T>]], cls: &[&'static [Clic
     g.cl_off.clear();
     g.cl_off.resize(np + 1, 0);
     for c in cls.iter().flat_map(|b| b.iter()) {
-        match find(&g.table, c.user) {
+        match find(&g.table, mask, c.user) {
             Some(pi) => {
                 g.cl_off[pi as usize] += 1;
                 g.cpidx.push(pi);
