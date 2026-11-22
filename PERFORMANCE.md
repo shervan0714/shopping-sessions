@@ -1,5 +1,44 @@
 # Performance report
 
+## Round 4 (branch `perf-round4`)
+
+Compared against a second implementation (u128 keys, mutex interner for
+long IDs) on identical data. No correctness difference found: both pass the
+36 fixtures, the dev answer and `scripts/fuzz.py` (204 rounds, seeds 11 and
+23), and their outputs match on 2M, 5M, 5M-long-ID and 20M generated sets.
+The work therefore went into parse CPU, the largest measured gap
+(`perf record`, 1 thread: parse 2731 vs 1702 samples).
+
+| Change | Why |
+|---|---|
+| `scan.rs`: 64-byte blocks, each field unwrapped when its separator is found (no per-line commas array walked again), no software prefetch | scanner micro-benchmark 0.14–0.175 s → 0.114–0.14 s on 5M events |
+| `ts.rs`: SWAR epoch digits (≤16 digits, slow path kept and fuzzed against), per-slot `Cell` date cache, `parse` inlined | removes a per-digit loop and a `RefCell` borrow per row |
+| `parse.rs` + `people.rs`: 64-row batches; link filter prefetched when the row is parsed, tested at flush | the filter probe was a cache miss per row |
+
+Laptop (WSL2, P/E cores), interleaved runs, medians of 5 (20M: 3); wall s /
+CPU s / peak RSS MB. `base` = 2bf0c82, `new` = this round, `other` = the
+compared implementation.
+
+| set | NCPU | base | new | other |
+|---|---|---|---|---|
+| 2M | 1 | 0.49 / 0.49 / 305 | 0.43 / 0.43 / 305 | 0.37 / 0.38 / 324 |
+| 2M | 8 | 0.27 / 1.50 / 347 | 0.24 / 1.30 / 352 | 0.15 / 0.97 / 365 |
+| 5M | 1 | 1.10 / 1.11 / 752 | 0.89 / 0.91 / 752 | 0.78 / 0.80 / 800 |
+| 5M | 2 | 0.74 / 1.45 / 761 | 0.64 / 1.23 / 761 | 0.59 / 1.18 / 805 |
+| 5M | 3 | 0.61 / 1.68 / 770 | 0.55 / 1.53 / 770 | 0.49 / 1.43 / 809 |
+| 5M | 8 | 0.46 / 3.05 / 803 | 0.39 / 2.38 / 801 | 0.26 / 1.91 / 829 |
+| 5M long IDs | 1 (9 runs) | 1.22 / 1.24 / 891 | 1.02 / 1.06 / 891 | 1.44 / 1.46 / 987 |
+| 5M long IDs | 8 (15 runs) | 0.46 / 2.93 / 961 | 0.44 / 2.78 / 960 | 3.07 / 11.08 / 1009 |
+| 20M | 1 | 5.10 / 5.21 / 2962 | 3.67 / 3.77 / 2963 | 3.15 / 3.29 / 3198 |
+| 20M | 2 | 3.10 / 6.20 / 2981 | 2.43 / 4.83 / 2981 | 1.95 / 4.06 / 3205 |
+| 20M | 3 | 2.38 / 7.09 / 3003 | 1.99 / 5.88 / 3003 | 1.64 / 5.04 / 3214 |
+| 20M | 8 | 1.90 / 13.70 / 3055 | 1.51 / 10.97 / 3058 | 1.13 / 9.12 / 3243 |
+
+Still open: the other implementation is faster on short-ID data. Measured
+causes: fresh huge-page zeroing (`clear_page_erms` 797 vs 366 samples:
+events/clicks part blocks and the user writer), and person resolution done
+inside parse. It uses ~7% more memory and is 2–7x slower on long IDs.
+
 ## Round 3 (branch `perf-round3`)
 
 Eight changes, one commit each, every one gated on: unit tests, the 36

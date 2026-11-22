@@ -202,23 +202,46 @@ fn price(b: &[u8]) -> Option<u32> {
 }
 
 pub fn events_chunk<T: Pack>(chunk: &[u8], ctx: &Ctx, w: &mut Worker<T>) {
-    // Once the people table is built (on its own thread, usually early in
-    // parsing), a valid copy whose user may be linked is resolved to its
-    // person right here, in batches with the lookups prefetched (like
-    // clicks); before that, it goes to the deferred list.
+    // Every valid copy goes through a small batch: its link-filter word is
+    // prefetched when the row is parsed and tested when the batch is
+    // flushed, ~BATCH rows later (the filter outgrows L2 at scale, and an
+    // unhinted test was a cache miss per event row). A user in no link is
+    // its own person: the payload goes straight to its partition. Once the
+    // people table is built (on its own thread, usually early in parsing), a
+    // user that may be linked is resolved to its person right in the flush,
+    // with the lookups prefetched for the batch; before that, the payload
+    // goes to the deferred list (resolved after dedup).
     let people = ctx.people.get();
+    let linked = ctx.linked;
     const BATCH: usize = 64;
     let mut batch = [(Cand { eid: 0, ingest: 0, pay: std::ptr::null_mut() }, Surv { person: 0, w: T::default() }); BATCH];
     let mut nb = 0usize;
-    let flush = |batch: &[(Cand, Surv<T>)], w: &mut Worker<T>| {
+    let mut maybe_linked = [0u8; BATCH];
+    let flush = |batch: &[(Cand, Surv<T>)], maybe_linked: &mut [u8; BATCH], w: &mut Worker<T>| {
+        let mut nl = 0usize;
+        for (i, &(mut c, s)) in batch.iter().enumerate() {
+            if !linked.maybe(s.person) {
+                // In no link: the user is the person.
+                c.pay = w.surv.push_ptr(ppart(s.person), s) as *mut u64;
+                w.push_event(c);
+            } else if people.is_some() {
+                maybe_linked[nl] = i as u8;
+                nl += 1;
+            } else {
+                c.pay = w.deferred.push_ptr(0, s) as *mut u64;
+                w.push_event(c);
+            }
+        }
         let Some(people) = people else { return };
-        for x in batch {
-            people.prefetch_filter(x.1.person);
+        let idx = &maybe_linked[..nl];
+        for &i in idx {
+            people.prefetch_filter(batch[i as usize].1.person);
         }
-        for x in batch {
-            people.prefetch_slot(x.1.person);
+        for &i in idx {
+            people.prefetch_slot(batch[i as usize].1.person);
         }
-        for &(mut c, s) in batch {
+        for &i in idx {
+            let (mut c, s) = batch[i as usize];
             let person = people.person(s.person);
             c.pay = w.surv.push_ptr(ppart(person), Surv { person, w: s.w }) as *mut u64;
             w.push_event(c);
@@ -233,7 +256,7 @@ pub fn events_chunk<T: Pack>(chunk: &[u8], ctx: &Ctx, w: &mut Worker<T>) {
         // ingest_ts is always valid F1 per the rules; if it ever is not, the
         // copy sorts last in dedup and is invalid if kept.
         let ingest = ts::parse(ingf);
-        let mut row = Cand { eid: ek, ingest: ingest.unwrap_or(i64::MAX), pay: std::ptr::null_mut() };
+        let row = Cand { eid: ek, ingest: ingest.unwrap_or(i64::MAX), pay: std::ptr::null_mut() };
         if let Some(ing) = ingest {
             if !user.is_empty() && !product.is_empty() {
                 let kind = match typ {
@@ -254,20 +277,14 @@ pub fn events_chunk<T: Pack>(chunk: &[u8], ctx: &Ctx, w: &mut Worker<T>) {
                             };
                             let u = key::<true>(user, ctx.exotic, &mut w.ids);
                             let s = Surv { person: u, w: T::ev((t - ctx.ws) as u64, p, cat) };
-                            if !ctx.linked.maybe(u) {
-                                // In no link: the user is the person.
-                                row.pay = w.surv.push_ptr(ppart(u), s) as *mut u64;
-                            } else if people.is_some() {
-                                batch[nb] = (row, s);
-                                nb += 1;
-                                if nb == BATCH {
-                                    flush(&batch, w);
-                                    nb = 0;
-                                }
-                                return;
-                            } else {
-                                row.pay = w.deferred.push_ptr(0, s) as *mut u64;
+                            linked.prefetch(u);
+                            batch[nb] = (row, s);
+                            nb += 1;
+                            if nb == BATCH {
+                                flush(&batch, &mut maybe_linked, w);
+                                nb = 0;
                             }
+                            return;
                         }
                     }
                 }
@@ -275,7 +292,7 @@ pub fn events_chunk<T: Pack>(chunk: &[u8], ctx: &Ctx, w: &mut Worker<T>) {
         }
         w.push_event(row);
     });
-    flush(&batch[..nb], w);
+    flush(&batch[..nb], &mut maybe_linked, w);
 }
 
 pub fn clicks_chunk<T: Pack>(chunk: &[u8], ctx: &Ctx, w: &mut Worker<T>) {

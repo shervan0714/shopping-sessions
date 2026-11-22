@@ -65,6 +65,19 @@ impl LinkFilter {
         LinkFilter { shift, words: words.into_iter().map(AtomicU64::into_inner).collect() }
     }
 
+    /// Hint the filter word for `k` into the cache (the filter is larger
+    /// than L2 at scale, so an unhinted `maybe` is a cache miss per event).
+    #[inline(always)]
+    pub fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        if self.shift != 64 {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let f = (mix(k) >> self.shift) as usize;
+            // SAFETY: prefetch of an in-bounds address; nothing is read.
+            unsafe { _mm_prefetch(self.words.as_ptr().add(f / 64) as *const i8, _MM_HINT_T0) };
+        }
+    }
+
     /// Whether `k` may appear in a link (false: it certainly does not).
     #[inline(always)]
     pub fn maybe(&self, k: u64) -> bool {

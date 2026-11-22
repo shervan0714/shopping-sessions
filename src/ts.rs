@@ -69,7 +69,9 @@ fn all_digits(x: u64, mask: u64) -> bool {
 
 thread_local! {
     /// Direct-mapped memo of validated dates: (first 8 bytes, bytes 8..10, days).
-    static DATES: std::cell::Cell<[(u64, u16, i32); 32]> = const { std::cell::Cell::new([(0, 0, 0); 32]) };
+    /// One `Cell` per slot, so a lookup copies one 16-byte entry (a single
+    /// `Cell` around the whole array copied all 32 entries on every call).
+    static DATES: [std::cell::Cell<(u64, u16, i32)>; 32] = const { [const { std::cell::Cell::new((0, 0, 0)) }; 32] };
 }
 
 /// The `YYYY-MM-DDTHH:MM:SS` prefix (19 bytes; caller checks length).
@@ -99,16 +101,12 @@ fn civil_prefix(b: &[u8]) -> Option<i64> {
     }
     let secs = h * 3_600 + mi * 60 + s;
     let slot = ((lo ^ (lo >> 29) ^ mid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 59) as usize;
-    let memo = DATES.with(|c| c.get()[slot]);
+    let memo = DATES.with(|c| c[slot].get());
     let days = if memo.0 == lo && memo.1 == mid && lo != 0 {
         memo.2 as i64
     } else {
         let days = civil_date(b)?;
-        DATES.with(|c| {
-            let mut m = c.get();
-            m[slot] = (lo, mid, days as i32);
-            c.set(m);
-        });
+        DATES.with(|c| c[slot].set((lo, mid, days as i32)));
         days
     };
     Some((days * 86_400 + secs) * SECOND)
@@ -149,9 +147,38 @@ fn civil_prefix_slow(b: &[u8]) -> Option<i64> {
     Some((days_from_civil(y, mo, d) * 86_400 + h * 3_600 + mi * 60 + s) * SECOND)
 }
 
-/// F3: digits only, any number of leading zeros.
-#[inline]
+/// Eight ASCII digits (first byte most significant, little-endian load) to
+/// their value; the caller has checked they are digits.
+#[inline(always)]
+fn swar8(x: u64) -> u64 {
+    let x = x.wrapping_sub(0x3030_3030_3030_3030);
+    let x = (x.wrapping_mul(10) + (x >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let x = (x.wrapping_mul(100) + (x >> 16)) & 0x0000_FFFF_0000_FFFF;
+    (x.wrapping_mul(10_000) + (x >> 32)) & 0xFFFF_FFFF
+}
+
+/// F3: digits only, any number of leading zeros. Values of up to 16 bytes
+/// (every in-window value is 13 digits, plus any leading zeros that fit) are
+/// right-aligned into a zero-digit-padded 16-byte buffer and converted with
+/// SWAR; longer ones take the byte loop.
+#[inline(always)]
 fn epoch_digits(b: &[u8]) -> Option<i64> {
+    let n = b.len();
+    if n.wrapping_sub(1) < 16 {
+        let mut buf = [b'0'; 16];
+        buf[16 - n..].copy_from_slice(b);
+        let hi = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        let lo = u64::from_le_bytes(buf[8..].try_into().unwrap());
+        if !all_digits(hi, !0) || !all_digits(lo, !0) {
+            return None;
+        }
+        return Some((swar8(hi) * 100_000_000 + swar8(lo)) as i64);
+    }
+    epoch_digits_slow(b)
+}
+
+/// F3 by a byte loop (any length; also the reference for the fast path).
+fn epoch_digits_slow(b: &[u8]) -> Option<i64> {
     if b.is_empty() || !b.iter().all(|c| c.is_ascii_digit()) {
         return None;
     }
@@ -171,7 +198,7 @@ fn epoch_digits(b: &[u8]) -> Option<i64> {
 }
 
 /// Parse any of F1, F2, F3.
-#[inline]
+#[inline(always)]
 pub fn parse(b: &[u8]) -> Option<i64> {
     match b.len() {
         20 if b[19] == b'Z' => civil_prefix(b),
@@ -197,6 +224,30 @@ pub fn parse(b: &[u8]) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epoch_fast_matches_slow() {
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = b"0123456789000/:.-eE x\x00";
+        for _ in 0..300_000 {
+            let n = (rnd() % 22) as usize;
+            let digits_only = rnd() % 3 != 0;
+            let s: Vec<u8> = (0..n)
+                .map(|_| if digits_only { b'0' + (rnd() % 10) as u8 } else { alphabet[(rnd() % alphabet.len() as u64) as usize] })
+                .collect();
+            assert_eq!(epoch_digits(&s), epoch_digits_slow(&s), "{:?}", String::from_utf8_lossy(&s));
+        }
+        for s in ["1791071890000", "0001791071890000", "0", "9999999999999999", "0000000000000000", "1", "86400000"] {
+            assert_eq!(epoch_digits(s.as_bytes()), epoch_digits_slow(s.as_bytes()), "{s}");
+            assert_eq!(epoch_digits(s.as_bytes()), Some(s.parse::<i64>().unwrap()));
+        }
+    }
 
     #[test]
     fn fast_matches_slow() {
