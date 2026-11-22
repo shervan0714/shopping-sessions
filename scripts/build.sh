@@ -5,7 +5,10 @@
 #   scripts/build.sh OUT_BINARY        (TARGET_CPU=cascadelake by default)
 #
 # 1. build the published generator (tools/generator) and make a 2M-event
-#    training set; 2. build an instrumented binary and run it on that set
+#    training set; if under 5 % of its event IDs are long (a generator from
+#    before Nov 21), lengthen ~1 in 9 user, event and click IDs by a 32-char
+#    hex suffix, so the profile trains the exotic-ID path the scorer's data
+#    takes (~12 % of IDs); 2. build an instrumented binary and run it on that set
 #    (NCPU 8 and 3) and on every fixture (rare paths); 3. merge the profile
 #    and build the final binary with it. If the training run cannot execute
 #    here (e.g. a build host without the target CPU's features) or
@@ -23,6 +26,25 @@ rm -rf "$W"; mkdir -p "$W"
 echo "== generator + training data"
 cargo build --release --locked --manifest-path tools/generator/Cargo.toml --target-dir "$W/gen-target"
 "$W/gen-target/release/generate" --seed 7 --events 2000000 --clicks 500000 --output "$W/train" >/dev/null
+# Share of event IDs over 10 bytes, in percent.
+long=$(awk -F, 'FNR > 1 { t++; v = $1; gsub(/"/, "", v); if (length(v) > 10) l++ } END { print t ? int(100 * l / t) : 0 }' "$W"/train/events/*.csv)
+if [ "$long" -lt 5 ]; then
+  echo "== training IDs: ${long}% long; lengthening IDs ending in 0-3 (new generator's hex suffix)"
+  for f in "$W"/train/events/*.csv "$W"/train/clicks/*.csv "$W"/train/links/*.csv; do
+    [ -f "$f" ] || continue
+    awk -F, -v OFS=, 'FNR == 1 { print; next } {
+        for (i = 1; i <= 2; i++) {
+          v = $i; q = 0
+          if (v ~ /^".*"$/) { q = 1; v = substr(v, 2, length(v) - 2) }
+          if (v ~ /[0-3]$/) v = v "5f3a9c0e7b2d4a6f8e1c3b5d7a9f0e2c"
+          $i = q ? "\"" v "\"" : v
+        }
+        print
+      }' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  done
+else
+  echo "== training IDs: ${long}% long (generator already writes long IDs)"
+fi
 
 echo "== instrumented build ($BASE)"
 RUSTFLAGS="$BASE -Cprofile-generate=$W/raw" cargo build --release --locked --target "$T" --target-dir "$W/target"
