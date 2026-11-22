@@ -14,20 +14,15 @@ use std::path::{Path, PathBuf};
 /// the page cache) for the life of the process, so every parsed string can be
 /// a `&'static [u8]` slice of the file with no copying.
 pub fn map_file(path: &Path) -> io::Result<&'static [u8]> {
-    Ok(map_open(path)?.0)
-}
-
-/// Like `map_file`, also returning the open file (leaked) for `pread`.
-pub fn map_open(path: &Path) -> io::Result<(&'static [u8], &'static File)> {
-    let file: &'static File = Box::leak(Box::new(File::open(path)?));
+    let file = File::open(path)?;
     if file.metadata()?.len() == 0 {
-        return Ok((&[], file));
+        return Ok(&[]);
     }
     // SAFETY: /data is read-only and nothing modifies the inputs while we run.
-    let map = unsafe { Mmap::map(file)? };
+    let map = unsafe { Mmap::map(&file)? };
     let _ = map.advise(Advice::Sequential);
     let map: &'static Mmap = Box::leak(Box::new(map));
-    Ok((&map[..], file))
+    Ok(&map[..])
 }
 
 pub const WILLNEED: i32 = 3;

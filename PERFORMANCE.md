@@ -16,7 +16,7 @@ consecutive runs unless noted. Treat them as upper bounds for the scorer.
 | Dataset | Input | Wall time | Notes |
 |---|---|---|---|
 | 1M dev (seed 1) | 96 MB, 84 files | ~0.1 s | `check-dev`: MATCH |
-| 20M (seed 7, 5M clicks) | 1.92 GB, 182 files | **1.38–1.6 s** (best 1.38 s) | user ≈ 9–10 s, sys ≈ 1.5 s; warm page cache |
+| 20M (seed 7, 5M clicks) | 1.92 GB, 182 files | **1.43–1.6 s** (best 1.43 s) | user CPU ≈ 10–11 s, sys ≈ 1–2 s; warm page cache |
 
 20M stage profile (typical warm run): parse + people (overlapped) 0.65–0.7 s ·
 dedup 0.3 s · click partition 0.05–0.1 s · sessions 0.3 s · Parquet 0.09 s.
@@ -53,9 +53,6 @@ than this laptop. That ratio is an estimate, not a measurement.
 | Zero-copy names, user_daily split into ~32 files | output 0.25 → 0.09 s |
 | Hash-group each person partition, sort per person (no 76K-row sorts) | 1.43 s |
 | Two-stage prefetch of person lookups; SWAR time + date memo | 1.45–1.6 s (within noise) |
-| **Round 3:** freed event blocks pooled and reused for survivors; clicks resolved to persons while parsing and written straight into person partitions (no click scatter pass); click lookups batched 64 at a time with prefetch; branchless quote unwrap; user_daily written during the session stage | min 1.30–1.38 s (perf: page zeroing 31 % → 13 % of CPU; output phase 0.09 → 0.02 s) |
-| Chunks read with `pread` into a 512 KB per-worker buffer instead of parsed through the mapping (the scanner's input load was 76 % of its time: the hardware prefetcher stops at every 4 KB page) | profile: ~14.6 → ~11 CPU-s per run |
-| SIMD ID packing (16-byte classify + two multiply-adds), fuzzed against the scalar packer; blocking wait (no spin) for the people table | best 1.38 s, ≈10.5 CPU-s (warm, 8 runs: 1.38–1.9 s once WSL memory is warm) |
 
 Profiles were taken with `perf record --call-graph fp`. The biggest wins
 came from removing dependent cache misses (key bytes in the mmapped input),
@@ -79,6 +76,5 @@ not from arithmetic.
 * IDs outside the packed alphabet/length ("exotic": spaces, `\r`, non-ASCII,
   over 10 bytes) take a slower locked-interner path. The fixtures exercise it;
   the generator never produces such IDs, so its speed at scale is untested.
-* Timings are from a noisy 15 W laptop (±15–30 % run to run, worse when hot);
-  round 3 decisions were made from `perf` CPU profiles rather than wall time; the first run after a
+* Timings are from a noisy 15 W laptop (±15% run to run); the first run after a
   pause is often much slower because WSL has to re-read the inputs.

@@ -5,7 +5,8 @@ use crate::scan::scan;
 use crate::input::Lookups;
 use crate::idkey::{key, mix};
 use crate::alloc::{Blocks, Parts, POOL_BLOCK};
-use crate::people::{ppart, PeopleSlot, PP};
+use crate::people::{ppart, People, PP};
+use std::sync::OnceLock;
 use crate::intern::Interner;
 use crate::ts::{self, DAY};
 
@@ -71,7 +72,7 @@ pub struct Ctx<'a> {
     pub exotic: &'a Interner,
     /// Set by the people thread; clicks (parsed after links and events)
     /// are resolved to their person right away.
-    pub people: &'a PeopleSlot,
+    pub people: &'a OnceLock<People>,
     pub ws: i64,
     pub we: i64,
 }
@@ -162,7 +163,7 @@ fn price(b: &[u8]) -> Option<u32> {
     (1..=10_000_000).contains(&v).then_some(v)
 }
 
-pub fn events_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
+pub fn events_chunk(chunk: &'static [u8], ctx: &Ctx, w: &mut Worker) {
     scan::<7>(chunk, |f| {
         let &[eid, user, tsf, ingf, typ, product, pricef] = f;
         if eid.is_empty() {
@@ -208,9 +209,14 @@ pub fn events_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
     });
 }
 
-pub fn clicks_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
+pub fn clicks_chunk(chunk: &'static [u8], ctx: &Ctx, w: &mut Worker) {
     let lo = ctx.ws - 7 * DAY;
-    let people = ctx.people.wait();
+    let people = loop {
+        if let Some(p) = ctx.people.get() {
+            break p;
+        }
+        std::thread::yield_now();
+    };
     // Person lookups are random reads: resolve clicks in batches, with the
     // filter words and then the table slots prefetched for the whole batch.
     const BATCH: usize = 64;
@@ -249,7 +255,7 @@ pub fn clicks_chunk(chunk: &[u8], ctx: &Ctx, w: &mut Worker) {
     flush(&buf[..nb], w);
 }
 
-pub fn links_chunk(chunk: &[u8], ctx: &Ctx, links: &mut Vec<(u64, u64)>) {
+pub fn links_chunk(chunk: &'static [u8], ctx: &Ctx, links: &mut Vec<(u64, u64)>) {
     scan::<2>(chunk, |f| {
         if f[0].is_empty() || f[1].is_empty() {
             return;

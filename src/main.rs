@@ -42,8 +42,7 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const GAP: i64 = 30 * MINUTE;
 const WEEK: i64 = 7 * DAY;
-/// Chunk size: small enough that a worker's read buffer stays in its L2.
-const CHUNK: usize = 512 << 10;
+const CHUNK: usize = 4 << 20;
 const NO_CATEGORY: u32 = u32::MAX;
 
 /// A surviving event, tagged with its person key.
@@ -113,17 +112,17 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
             files.push((kind, p));
         }
     }
-    let mapped: Vec<(u8, &'static [u8], &'static std::fs::File)> = files
+    let mapped: Vec<(u8, &'static [u8])> = files
         .par_iter()
-        .map(|(k, p)| input::map_open(p).map(|(d, f)| (*k, d, f)))
+        .map(|(k, p)| input::map_file(p).map(|d| (*k, d)))
         .collect::<Result<_, _>>()?;
-    let mut tasks: Vec<Task> = Vec::new();
+    let mut tasks: Vec<(u8, &'static [u8])> = Vec::new();
     let mut total_bytes = 0usize;
-    for &(k, data, file) in &mapped {
+    for &(k, data) in &mapped {
         total_bytes += data.len();
         let mut cs = Vec::new();
         input::chunks(input::body(data), CHUNK, &mut cs);
-        tasks.extend(cs.into_iter().map(|c| (k, c, file, c.as_ptr() as usize - data.as_ptr() as usize)));
+        tasks.extend(cs.into_iter().map(|c| (k, c)));
     }
 
 
@@ -134,7 +133,7 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     let release_chunks = (total_bytes as f64) * 2.2 > mem_bytes * 0.8;
     log(t0, &format!("mapped {} files, {:.1} MB, {} chunks, release chunks: {release_chunks}", files.len(), total_bytes as f64 / 1e6, tasks.len()));
     // Leaked so the readahead thread can follow the parsers' progress.
-    let tasks: &'static [Task] = Box::leak(tasks.into_boxed_slice());
+    let tasks: &'static [(u8, &'static [u8])] = Box::leak(tasks.into_boxed_slice());
     let next: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
 
     // Background readahead: hint the kernel to read chunks ahead of the
@@ -144,7 +143,7 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     if std::env::var_os("SS_NO_READAHEAD").is_none() {
         const RA_AHEAD: usize = 128;
         std::thread::spawn(move || {
-            for (i, &(_, chunk, _, _)) in tasks.iter().enumerate() {
+            for (i, &(_, chunk)) in tasks.iter().enumerate() {
                 while i > next.load(Relaxed) + RA_AHEAD {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
@@ -155,7 +154,7 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
 
     // ---- 2. parse ---------------------------------------------------------
     let exotic = intern::Interner::new();
-    let people_cell = people::PeopleSlot::default();
+    let people_cell: std::sync::OnceLock<people::People> = std::sync::OnceLock::new();
     let pctx = parse::Ctx { lookups: &lookups, exotic: &exotic, people: &people_cell, ws, we };
     let nthreads = rayon::current_num_threads();
     // Links first (small), so the people table can be built on its own
@@ -163,7 +162,7 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     let n_link_tasks = tasks.iter().take_while(|t| t.0 == 2).count();
     let link_vecs: Vec<Vec<(u64, u64)>> = tasks[..n_link_tasks]
         .par_iter()
-        .map(|&(_, chunk, _, _)| {
+        .map(|&(_, chunk)| {
             let mut w = parse::LinkSink::default();
             parse::links_chunk(chunk, &pctx, &mut w.links);
             w.links
@@ -173,11 +172,11 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     let n_links: usize = link_vecs.iter().map(Vec::len).sum();
     let workers = std::thread::scope(|sc| {
         sc.spawn(|| {
-            people_cell.set(people::People::build(&link_vecs, &exotic));
+            let _ = people_cell.set(people::People::build(&link_vecs, &exotic));
         });
         parse_all(nthreads, tasks, next, &pctx, release_chunks)
     });
-    let people = people_cell.wait();
+    let people = people_cell.get().expect("people table");
     drop(link_vecs);
     let n_ev_rows: usize = workers.iter().map(|w| w.n_events).sum();
     let n_clicks: usize = workers.iter().map(|w| w.n_clicks).sum();
@@ -283,31 +282,10 @@ fn run(data_dir: &Path, out_dir: &Path, t0: Instant) -> Result<(), Error> {
     Ok(())
 }
 
-/// (kind, chunk of the mapping, its file, offset of the chunk in the file)
-type Task = (u8, &'static [u8], &'static std::fs::File, usize);
-
-/// `len` bytes of `file` at `off`, read into `buf`; `None` on any error.
-fn read_at<'b>(file: &std::fs::File, off: usize, len: usize, buf: &'b mut Vec<u8>) -> Option<&'b [u8]> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        if buf.len() < len {
-            buf.resize(len, 0);
-        }
-        file.read_exact_at(&mut buf[..len], off as u64).ok()?;
-        Some(&buf[..len])
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (file, off, len, buf);
-        None
-    }
-}
-
 /// Parse every remaining (event and click) chunk on `nthreads` workers.
 fn parse_all(
     nthreads: usize,
-    tasks: &'static [Task],
+    tasks: &'static [(u8, &'static [u8])],
     next: &'static AtomicUsize,
     pctx: &parse::Ctx,
     release_chunks: bool,
@@ -316,21 +294,12 @@ fn parse_all(
         .into_par_iter()
         .map(|_| {
             let mut w = Worker::new();
-            let mut buf: Vec<u8> = Vec::new();
             loop {
                 let i = next.fetch_add(1, Relaxed);
-                let Some(&(k, chunk, file, off)) = tasks.get(i) else { break };
-                // Read the chunk into a small reused buffer instead of
-                // parsing through the file mapping: one streaming kernel
-                // copy, then the parser reads cache-hot memory (through the
-                // mapping it stalled on every 4 KB page).
-                let data: &[u8] = match read_at(file, off, chunk.len(), &mut buf) {
-                    Some(d) => d,
-                    None => chunk, // fall back to the mapping
-                };
+                let Some(&(k, chunk)) = tasks.get(i) else { break };
                 match k {
-                    0 => parse::events_chunk(data, pctx, &mut w),
-                    _ => parse::clicks_chunk(data, pctx, &mut w),
+                    0 => parse::events_chunk(chunk, pctx, &mut w),
+                    _ => parse::clicks_chunk(chunk, pctx, &mut w),
                 }
                 // Done with this chunk's pages: let the kernel drop them from
                 // our mapping (clean, file-backed; refaults if ever needed).
